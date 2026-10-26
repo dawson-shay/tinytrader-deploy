@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Turn on the batch scheduler's ACLs, once, on the server's host (the mini),
+# after its first switch with Nomad (docs/batch-jobs.md):
+#   1. `nomad acl bootstrap`: Nomad makes its management token, which goes
+#      straight into the site's secrets/nomad.env (NOMAD_TOKEN), encrypted
+#      with sops to the site's .sops.yaml recipients. It is never printed.
+#   2. The anonymous policy (the site's deploy/nomad/acl/anonymous.hcl, or
+#      this stack's): anyone on the tailnet reads, the UI included; changes
+#      take the token.
+#   3. Registers the jobs (scripts/job register).
+# Run again, it skips step 1 (the token in secrets/nomad.env is used) and
+# re-applies the rest. Then commit secrets/nomad.env, so scripts/job works on
+# every Mac with the operator key.
+#   scripts/nomad-bootstrap
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+export PATH="/run/current-system/sw/bin:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"
+for c in nomad sops jq curl; do command -v "$c" >/dev/null || { echo "$c not found" >&2; exit 1; }; done
+out="$site/secrets/nomad.env"
+policy="$site/deploy/nomad/acl/anonymous.hcl"
+[ -f "$policy" ] || policy="$stack/deploy/nomad/acl/anonymous.hcl"
+# sops reads the site's .sops.yaml from here.
+cd "$site"
+export NOMAD_ADDR="${NOMAD_ADDR:-http://127.0.0.1:4646}"
+
+curl -fsS -m 5 "$NOMAD_ADDR/v1/status/leader" >/dev/null 2>&1 || {
+  echo "no Nomad server answers at $NOMAD_ADDR: run this on the server's host after its switch" >&2
+  exit 1
+}
+
+if [ -f "$out" ]; then
+  echo "secrets/nomad.env exists: using its token (ACLs were bootstrapped before)"
+else
+  # sops must be able to encrypt before Nomad makes a token it shows only once.
+  printf 'CHECK=1\n' | sops encrypt --filename-override "$out" --input-type dotenv --output-type dotenv /dev/stdin >/dev/null || {
+    echo "sops can't encrypt secrets/nomad.env here (.sops.yaml, the operator key): nothing done" >&2
+    exit 1
+  }
+  # The token only ever passes through this pipe and into sops.
+  if ! nomad acl bootstrap -json | jq -r '"NOMAD_TOKEN=" + .SecretID' |
+    sops encrypt --filename-override "$out" --input-type dotenv --output-type dotenv /dev/stdin >"$out.tmp"; then
+    rm -f "$out.tmp"
+    echo "nomad acl bootstrap failed (already bootstrapped elsewhere? Nomad's docs: 'ACL bootstrap reset')" >&2
+    exit 1
+  fi
+  mv "$out.tmp" "$out"
+  echo "stored the management token in secrets/nomad.env"
+fi
+keys="$(sops decrypt --input-type dotenv --output-type dotenv "$out" | cut -d= -f1 | tr '\n' ' ')"
+[ "$keys" = "NOMAD_TOKEN " ] || { echo "secrets/nomad.env holds '$keys', expected NOMAD_TOKEN" >&2; exit 1; }
+
+sops exec-env "$out" "nomad acl policy apply -description 'Read only, from anywhere on the tailnet (deploy/nomad/acl/anonymous.hcl)' anonymous $(printf %q "$policy")"
+echo "applied the anonymous policy"
+"$stack/scripts/job" register
+echo
+echo "Next, in the site: git add secrets/nomad.env && git commit -m 'secrets: the Nomad management token', and merge."

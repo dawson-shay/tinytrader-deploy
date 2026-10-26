@@ -1,0 +1,295 @@
+# An example site's containers (docs/site.md): one file for every host, each
+# host running only the services the inventory places on it (`services`,
+# docs/decisions/0005). Started by tinytrader-deploy's scripts/local-up.sh
+# and scripts/deploy, which supply TINYTRADER_SRC (a tinytrader checkout),
+# TINYTRADER_SITE (the site), TINYTRADER_DEPLOY (this stack),
+# TINYTRADER_TOPOLOGY and the keys (decrypted into their environment only).
+# Native services (the store, the Databento key's holders) run under launchd
+# instead (roles/darwin.nix).
+#
+# Services reach each other at ${TT_ADDR_<SERVICE>} (host:port) and
+# ${TT_URL_<SERVICE>} (http://host:port), the port's name appended for a
+# service with several (_STREAM, _OBSERVE): generated per host from the
+# placement map (deploy/local/endpoints.nix, docs/decisions/0008). A
+# container's own listen and published ports are its inventory `ports`.
+# Ports are published on 127.0.0.1 only, and each but the localOnly
+# services' is forwarded from the tailnet by `tailscale serve`
+# (scripts/tailnet-serve, docs/decisions/0010).
+#
+# The project's name is the inventory's deployment.name (checks.compose-name).
+name: my-site
+
+# Every service: restarted on failure, rotated logs and a memory cap.
+x-service: &service
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+# tinytrader's images are built by Nix from a tinytrader checkout (its
+# nix/build-images.sh), as tinytrader/<service>:nix; scripts/deploy and
+# scripts/local-up.sh build them.
+
+# Bundle hours, New York time (topology.json's bundles): the capture
+# bundle's (the inventory's deployment.captureHours), and the market day's.
+x-hours:
+  options: &options-hours "09:25-16:20"
+  day: &day-hours "07:55-17:05"
+
+services:
+  # Alpaca IEX prices for SPY, on the paper account's key.
+  relay-iex:
+    <<: *service
+    image: tinytrader/relay:nix
+    labels: { tinytrader.observe: "9114", tinytrader.label: relay IEX }
+    environment:
+      APCA_API_KEY_ID_FILE: /run/secrets/apca_api_key_id
+      APCA_API_SECRET_KEY_FILE: /run/secrets/apca_api_secret_key
+      RELAY_SOURCE: alpaca-iex
+      RELAY_SYMBOLS: SPY
+      RELAY_LISTEN: 0.0.0.0:7610
+      RELAY_OBSERVE_LISTEN: 0.0.0.0:9114
+      RELAY_HOURS: *day-hours
+      RELAY_CALENDAR: ${TT_URL_ACCOUNTS:?}/calendar
+    secrets:
+      - { source: account_paper_key_id, target: apca_api_key_id }
+      - { source: account_paper_secret_key, target: apca_api_secret_key }
+    ports: ["127.0.0.1:7610:7610", "127.0.0.1:9114:9114"]
+    mem_limit: 768m
+    cpus: 2.0
+
+  # The Alpaca accounts, read only (each from the site's
+  # secrets/accounts/<name>.env), and the market calendar the relays read.
+  accounts:
+    <<: *service
+    image: tinytrader/alpaca-account:nix
+    labels: { tinytrader.observe: "9107", tinytrader.label: accounts }
+    environment:
+      ALPACA_ACCOUNTS: paper=Paper
+      ALPACA_ACCOUNT_LISTEN: 0.0.0.0:9107
+      ALPACA_ACCOUNT_HOURS: *day-hours
+      ALPACA_ACCOUNT_RELAYS: stocks=${TT_ADDR_RELAY_IEX_STREAM:?};SPY=${TT_ADDR_RELAY_OPRA_SPY_STREAM:?}
+    secrets:
+      - { source: account_paper_key_id, target: paper_key_id }
+      - { source: account_paper_secret_key, target: paper_secret_key }
+    ports: ["127.0.0.1:9107:9107"]
+    mem_limit: 128m
+    cpus: 0.5
+
+  # Market data for any symbol on request, for the console.
+  alpaca-data:
+    <<: *service
+    image: tinytrader/alpaca-data:nix
+    labels: { tinytrader.observe: "9125" }
+    environment:
+      APCA_API_KEY_ID_FILE: /run/secrets/apca_api_key_id
+      APCA_API_SECRET_KEY_FILE: /run/secrets/apca_api_secret_key
+      ALPACA_DATA_LISTEN: 0.0.0.0:9125
+      ALPACA_DATA_DIR: /data
+      ALPACA_DATA_QUOTES: SPY=${TT_URL_RELAY_OPRA_SPY_OBSERVE:?}
+    volumes:
+      - alpaca-data:/data
+    secrets:
+      - { source: account_paper_key_id, target: apca_api_key_id }
+      - { source: account_paper_secret_key, target: apca_api_secret_key }
+    ports: ["127.0.0.1:9125:9125"]
+    mem_limit: 256m
+    cpus: 0.5
+
+  # JupyterLab for the site's research/ notebooks, built from this stack's
+  # deploy/local/research with the site's pyproject.toml and uv.lock. No
+  # drive is mounted: notebooks ask the store (docs/decisions/0007).
+  research:
+    <<: *service
+    build:
+      context: "${TINYTRADER_DEPLOY:?run scripts/local-up.sh}/deploy/local/research"
+      additional_contexts: { project: ../.. }
+    image: my-site/research:local
+    ports: ["127.0.0.1:8888:8888"]
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-}
+      TT_CONSOLE: ${TT_HTTPS_URL_CONSOLE:?}
+      TT_STORE: ${TT_URL_STORE:?}
+    volumes:
+      - ${TINYTRADER_SITE:?run scripts/local-up.sh}/research:/work
+    mem_limit: 2g
+    cpus: 2
+
+  # An order gateway (tinytrader services/order-gateway): the only holder of
+  # its account's keys, published on loopback only. Its journal is a bind
+  # mount, never auto-created.
+  order-gateway-paper:
+    <<: *service
+    image: tinytrader/order-gateway:nix
+    command:
+      - --account=paper
+      - --broker=alpaca-paper
+      - --credentials=env
+      - --listen=0.0.0.0:7701
+      - --listen-any
+      - --state=/data/paper
+      - --underlyings=SPY
+      - --max-notional=2500
+      - --client=ops,admin,,env:GATEWAY_OPS_TOKEN
+      - --client=console,trade,tt-,env:GATEWAY_CONSOLE_TOKEN
+      - --any-underlying-client=console
+    environment:
+      APCA_API_KEY_ID_FILE: /run/secrets/apca_api_key_id
+      APCA_API_SECRET_KEY_FILE: /run/secrets/apca_api_secret_key
+      GATEWAY_OPS_TOKEN_FILE: /run/secrets/gateway_ops_token
+      GATEWAY_CONSOLE_TOKEN_FILE: /run/secrets/gateway_console_token
+    secrets:
+      - { source: account_paper_key_id, target: apca_api_key_id }
+      - { source: account_paper_secret_key, target: apca_api_secret_key }
+      - gateway_ops_token
+      - gateway_console_token
+    ports: ["127.0.0.1:7701:7701"]
+    volumes:
+      - type: bind
+        source: ${HOME}/.local/state/order-gateway/paper
+        target: /data/paper
+        bind: { create_host_path: false }
+    mem_limit: 128m
+    cpus: 0.5
+
+  console:
+    <<: *service
+    image: tinytrader/console:nix
+    labels: { tinytrader.observe: "8080" }
+    environment:
+      CONSOLE_LISTEN: 0.0.0.0:8080
+      CONSOLE_TOPOLOGY: /etc/tinytrader/topology.json
+      CONSOLE_DOCKER: ${TT_URL_DOCKER_PROXY:?}
+      CONSOLE_COMPOSE_PROJECT: my-site
+      CONSOLE_COLLECTIONS: Docs=/srv/docs/site,/srv/docs/deploy,/srv/docs/tinytrader,/srv/research
+      CONSOLE_JOBS: ${TT_URL_DATABENTO_JOBS:?}
+      CONSOLE_QUEUE: ${TT_URL_QUEUE:?}
+      CONSOLE_STORE: ${TT_URL_STORE:?}
+      CONSOLE_STORE_TOKEN_FILE: /run/secrets/store_write_token
+      CONSOLE_NOTIFY: ${CONSOLE_NOTIFY:-}
+      # State kept in git (the site's state/console).
+      CONSOLE_REMINDERS: /srv/state/console/reminders.json
+      CONSOLE_PREFS_DEFAULTS: /srv/state/console/layouts.json
+      CONSOLE_PREFS: /data/prefs.json
+      CONSOLE_PROFILES: /data/profiles
+      CONSOLE_GATEWAYS: paper=${TT_ADDR_ORDER_GATEWAY_PAPER:?}
+      CONSOLE_GATEWAY_TOKEN_FILE: /run/secrets/gateway_ops_token
+      CONSOLE_TRADE_TOKEN_FILE: /run/secrets/gateway_console_token
+      # The write gate: a Host on CONSOLE_HOSTS and a Tailscale-User-Login on
+      # CONSOLE_WRITE_LOGINS (the site's secrets/console.env).
+      CONSOLE_HOSTS: ${TT_HTTPS_NAME_CONSOLE:?}
+      CONSOLE_WRITE_LOGINS: ${CONSOLE_ORDER_LOGINS:-}
+      CONSOLE_JOBS_APPROVE_TOKEN_FILE: /run/secrets/console_jobs_approve_token
+    secrets:
+      - gateway_ops_token
+      - gateway_console_token
+      - store_write_token
+      - console_order_token
+      - console_jobs_approve_token
+    volumes:
+      - ${TINYTRADER_TOPOLOGY:?run scripts/local-up.sh}:/etc/tinytrader/topology.json:ro
+      - ${TINYTRADER_SITE:?run scripts/local-up.sh}/docs:/srv/docs/site:ro
+      - ${TINYTRADER_DEPLOY:?run scripts/local-up.sh}/docs:/srv/docs/deploy:ro
+      - ${TINYTRADER_SRC}/docs:/srv/docs/tinytrader:ro
+      - ${TINYTRADER_SITE}/research:/srv/research:ro
+      - console-data:/data
+      - ${TINYTRADER_SITE}/state/console:/srv/state/console
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on: [docker-proxy]
+    mem_limit: 256m
+    cpus: 1.0
+
+  # Read-only view of the Docker API, for the console.
+  docker-proxy:
+    <<: *service
+    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    expose: ["2375"]
+    environment:
+      CONTAINERS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    mem_limit: 64m
+    cpus: 1.0
+
+  # The job queue: work from the site's queue-templates.yaml.
+  queue:
+    <<: *service
+    image: tinytrader/queue:nix
+    labels: { tinytrader.observe: "9123", tinytrader.label: queue }
+    environment:
+      QUEUE_LISTEN: 0.0.0.0:9123
+      QUEUE_TEMPLATES: /etc/queue/templates.yaml
+      QUEUE_STATE: /data
+      QUEUE_DOCKER: ${TT_URL_QUEUE_DOCKER_PROXY:?}
+      QUEUE_NETWORK: my-site_default
+      QUEUE_MAX_RUNNING: "2"
+      QUEUE_YIELD_TO: relay-opra-spy=${TT_URL_RELAY_OPRA_SPY_OBSERVE:?}
+      QUEUE_CALENDAR: ${TT_URL_ACCOUNTS:?}/calendar
+      TINYTRADER_SITE: ${TINYTRADER_SITE}
+      TT_URL_CONSOLE: ${TT_URL_CONSOLE:?}
+    volumes:
+      - ${TINYTRADER_SITE}/deploy/local/queue-templates.yaml:/etc/queue/templates.yaml:ro
+      - queue-data:/data
+    ports: ["127.0.0.1:9123:9123"]
+    networks: [default, queue-docker]
+    depends_on: [queue-docker-proxy]
+    mem_limit: 128m
+    cpus: 0.5
+
+  # The queue's own Docker access: containers only, on a network only the
+  # queue joins.
+  queue-docker-proxy:
+    <<: *service
+    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    expose: ["2375"]
+    environment:
+      CONTAINERS: 1
+      POST: 1
+      EXEC: 0
+      IMAGES: 0
+      NETWORKS: 0
+      VOLUMES: 0
+      BUILD: 0
+      COMMIT: 0
+      SWARM: 0
+      SERVICES: 0
+      TASKS: 0
+      SECRETS: 0
+      CONFIGS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      AUTH: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [queue-docker]
+    mem_limit: 64m
+    cpus: 0.5
+
+networks:
+  default:
+  queue-docker:
+    internal: true
+
+volumes:
+  alpaca-data:
+  console-data:
+  queue-data:
+
+# Taken from local-up's environment, never written to disk: each
+# secrets/accounts/<name>.env becomes ACCOUNT_<NAME>_KEY_ID and
+# ACCOUNT_<NAME>_SECRET_KEY; the rest are the site's secrets/*.env keys.
+secrets:
+  account_paper_key_id:
+    environment: ACCOUNT_PAPER_KEY_ID
+  account_paper_secret_key:
+    environment: ACCOUNT_PAPER_SECRET_KEY
+  gateway_ops_token:
+    environment: GATEWAY_OPS_TOKEN
+  gateway_console_token:
+    environment: GATEWAY_CONSOLE_TOKEN
+  store_write_token:
+    environment: STORE_WRITE_TOKEN
+  console_order_token:
+    environment: CONSOLE_ORDER_TOKEN
+  console_jobs_approve_token:
+    environment: CONSOLE_JOBS_APPROVE_TOKEN

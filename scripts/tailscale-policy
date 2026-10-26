@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Write the site's tailscale/policy.hujson from its inventory.nix
+# (tailscale/policy.nix, docs/decisions/0008). It changes only the file:
+# applying the policy to the tailnet is the operator's step (the admin
+# console, or the gitops action). The site is scripts/lib/site.sh's.
+#   scripts/tailscale-policy           write it
+#   scripts/tailscale-policy --check   fail if it is out of date; change nothing
+set -euo pipefail
+export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:$PATH"
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+new="$(stack_eval tailscale/policy.nix --raw)"
+if [ "${1:-}" = --check ]; then
+  diff -u "$site/tailscale/policy.hujson" <(printf '%s\n' "$new") && echo "tailscale/policy.hujson is up to date"
+else
+  mkdir -p "$site/tailscale"
+  printf '%s\n' "$new" > "$site/tailscale/policy.hujson"
+  echo "wrote tailscale/policy.hujson"
+fi

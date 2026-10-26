@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# restore-state: put a backup-state snapshot back on this host (docs/operations.md
+# "Restore from backup"). Dry run unless --apply: it says what it would do.
+#
+#   scripts/restore-state [--apply] [--force] [--key FILE] SNAPSHOT [WHAT...]
+#
+# SNAPSHOT  a snapshot folder (~/Backups/tinytrader/<date-time>), or an
+#           off-host copy (<date-time>.tar.zst.age), decrypted with the
+#           operator key (--key, default the sops key under your home) or the
+#           recovery key (--key FILE with it, from your password manager)
+# WHAT      volumes, volume:<name>, gateways, gateway:<account>; default all
+#           of the volumes and gateways. Repositories are never written: take
+#           unpushed work from <snapshot>/repos with git.
+#
+# Safety:
+# - It checks the snapshot's SHA256SUMS first, and stops if any file differs.
+# - A volume is restored only when no running container mounts it; what it
+#   held is saved first under ~/Backups/tinytrader-pre-restore/<time>.
+# - A gateway's state is restored only when that gateway isn't running (no
+#   container, no native process), and never over a journal that is ahead of
+#   the snapshot's (a higher seq: orders the snapshot doesn't know) unless
+#   --force. The current state root is moved aside, never deleted.
+set -euo pipefail
+
+# The tools come from the site's flake (packages.<system>.restore-state).
+if [ -z "${BACKUP_STATE_PACKAGED:-}" ]; then
+  export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:$PATH"
+  # shellcheck disable=SC1091 # (from a checkout only: the package never gets here)
+  . "$(dirname "${BASH_SOURCE[0]}")/lib/site.sh"
+  exec nix run "$TINYTRADER_SITE#restore-state" -- "$@"
+fi
+
+usage() { sed -n '5,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+apply=0 force=0 key="" snap="" what=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) apply=1 ;;
+    --force) force=1 ;;
+    --key) key="${2:?--key FILE}"; shift ;;
+    -h | --help | -*) usage ;;
+    *) if [ -z "$snap" ]; then snap="$1"; else what+=("$1"); fi ;;
+  esac
+  shift
+done
+[ -n "$snap" ] || usage
+[ "${#what[@]}" -gt 0 ] || what=(volumes gateways)
+
+project="${BACKUP_PROJECT:-tinytrader}" # the deployment's name, set by the flake
+gw="${BACKUP_GATEWAY_STATE:-$HOME/.local/state/order-gateway}"
+helper_image="${BACKUP_HELPER_IMAGE:-alpine:3}"
+aside="${BACKUP_PRE_RESTORE:-$HOME/Backups/tinytrader-pre-restore}/$(date +%Y-%m-%d-%H%M%S)"
+
+log() { printf 'restore-state: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+act() { # what it does, then the command
+  local msg="$1"; shift
+  if [ "$apply" = 1 ]; then log "$msg"; "$@"; else log "would $msg"; fi
+}
+umask 077
+
+# An off-host copy: decrypt into a private temporary folder under the home
+# (Colima mounts only the home into its VM).
+tmp=""
+cleanup() { [ -z "$tmp" ] || rm -rf "$tmp"; }
+trap cleanup EXIT
+if [ -f "$snap" ]; then
+  case "$snap" in *.tar.zst.age) ;; *) die "$snap: not a snapshot folder or a .tar.zst.age" ;; esac
+  if [ -z "$key" ]; then
+    for k in "${SOPS_AGE_KEY_FILE:-}" "$HOME/Library/Application Support/sops/age/keys.txt" "$HOME/.config/sops/age/keys.txt"; do
+      [ -n "$k" ] && [ -f "$k" ] && { key="$k"; break; }
+    done
+  fi
+  [ -n "$key" ] && [ -r "$key" ] || die "no age key to decrypt with (--key FILE: the operator key, or the recovery key)"
+  tmp="$(mktemp -d "$HOME/.restore-state.XXXXXX")"
+  log "decrypting $(basename "$snap") with $key"
+  age -d -i "$key" "$snap" | zstd -dq | tar -C "$tmp" -xf -
+  snap="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+fi
+[ -d "$snap" ] || die "no snapshot at $snap"
+snap="$(cd "$snap" && pwd)"
+[ -f "$snap/SHA256SUMS" ] || die "$snap has no SHA256SUMS: not a backup-state snapshot"
+(cd "$snap" && sha256sum --quiet -c SHA256SUMS) || die "$snap: checksums differ (above): not restoring from it"
+log "snapshot $snap: checksums match ($(jq -r '"from \(.host), \(.at)"' "$snap/MANIFEST.json" 2>/dev/null || echo "no manifest"))"
+[ "$apply" = 1 ] || log "dry run: nothing is changed; --apply to do it"
+
+restore_volume() { # SHORT
+  local k="$1" n="${project}_$1" tar="$snap/volumes/$1.tar" running=()
+  [ -f "$tar" ] || die "volume $k: not in this snapshot (it has: $(find "$snap/volumes" -name '*.tar' -exec basename {} .tar \; 2>/dev/null | sort | paste -sd' ' -))"
+  mapfile -t running < <(docker ps -q --filter "volume=$n" --filter status=running)
+  if [ "${#running[@]}" -gt 0 ]; then
+    die "volume $k: mounted by running container(s) $(docker inspect -f '{{.Name}}' "${running[@]}" | tr -d / | paste -sd' ' -): stop them first (scripts/deploy --remove <service>)"
+  fi
+  if docker volume inspect "$n" >/dev/null 2>&1; then
+    act "save what $n holds now to $aside/volumes/$k.tar" \
+      bash -c 'mkdir -p "$1" && docker run --rm --network none -v "$2:/src:ro" -v "$1:/dst" "$3" sh -c "tar -C /src --numeric-owner -cpf /dst/$4.tar ."' _ "$aside/volumes" "$n" "$helper_image" "$k"
+  else
+    act "create volume $n" docker volume create \
+      --label "com.docker.compose.project=$project" --label "com.docker.compose.volume=$k" "$n"
+  fi
+  act "restore $n from $k.tar ($(du -h "$tar" | cut -f1))" \
+    docker run --rm --network none -v "$n:/dst" -v "$snap/volumes:/src:ro" "$helper_image" \
+      sh -c "find /dst -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar -C /dst --numeric-owner -xpf /src/$k.tar"
+}
+
+journal_seq() { # STATE_ROOT: the last seq in its newest journal file
+  local f
+  f="$(find "$1/journal" -name '????-??-??.jsonl' 2>/dev/null | sort | tail -n1)"
+  [ -n "$f" ] || { echo 0; return; }
+  grep . "$f" | tail -n1 | sed -E 's/,"prev":"[0-9a-f]{64}"\}$/}/' | jq -r '.seq // 0' 2>/dev/null || echo 0
+}
+
+restore_gateway() { # ACCOUNT
+  local a="$1" from="$snap/order-gateway/$1" to="$gw/$1" have want
+  [ -d "$from" ] || die "gateway $a: not in this snapshot"
+  if [ -n "$(docker ps -q --filter "label=com.docker.compose.service=order-gateway-$a" --filter status=running 2>/dev/null)" ]; then
+    die "gateway $a: its container is running: stop it first (scripts/deploy --remove order-gateway-$a)"
+  fi
+  if pgrep -f -- "--account[= ]$a( |$)" >/dev/null 2>&1; then
+    die "gateway $a: a native gateway process for it is running (scripts/order-gateway-native): stop it first"
+  fi
+  want="$(journal_seq "$from")"
+  if [ -d "$to" ]; then
+    have="$(journal_seq "$to")"
+    if [ "$have" -gt "$want" ] && [ "$force" = 0 ]; then
+      die "gateway $a: the journal here is at seq $have, the snapshot's at $want: it holds orders the snapshot doesn't. Not replacing it (--force to, after you have looked)"
+    fi
+    act "move $to aside to $aside/order-gateway/$a (seq $have)" \
+      bash -c 'mkdir -p "$(dirname "$2")" && mv "$1" "$2"' _ "$to" "$aside/order-gateway/$a"
+  fi
+  act "restore gateway $a (seq $want) into $to" \
+    bash -c 'mkdir -p "$(dirname "$2")" && rsync -a "$1/" "$2/"' _ "$from" "$to"
+}
+
+[ ! -d "$snap/volumes" ] || docker info >/dev/null 2>&1 || die "the Docker engine isn't answering: start it (Docker Desktop, or Colima) first"
+for w in "${what[@]}"; do
+  case "$w" in
+    volumes)
+      for t in "$snap"/volumes/*.tar; do [ -e "$t" ] && restore_volume "$(basename "$t" .tar)"; done ;;
+    volume:*) restore_volume "${w#volume:}" ;;
+    gateways)
+      for d in "$snap"/order-gateway/*/; do [ -d "$d" ] && restore_gateway "$(basename "$d")"; done ;;
+    gateway:*) restore_gateway "${w#gateway:}" ;;
+    *) usage ;;
+  esac
+done
+log "repositories are not restored: see $snap/repos (git -C $snap/repos/<name> log --branches --not --remotes)"
+[ "$apply" = 1 ] || log "dry run done: nothing changed"

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Add order-gateway client tokens to the site's secrets/gateway.env (sops), each random,
+# never printed. Names already present are left alone. The operator runs this;
+# agents never create tokens.
+#   scripts/gateway-token GATEWAY_MYBOT_TOKEN GATEWAY_MYBOT_ADMIN_TOKEN
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+cd "$site"  # sops finds the site's .sops.yaml from here
+sops="$(command -v sops || echo "$HOME/.nix-profile/bin/sops")"
+f="$site/secrets/gateway.env"
+current="$("$sops" decrypt "$f")"
+added=()
+for name in "$@"; do
+  [[ "$name" =~ ^GATEWAY_[A-Z0-9_]+_TOKEN$ ]] || { echo "not a token name: $name" >&2; exit 2; }
+  grep -q "^$name=" <<<"$current" && { echo "$name exists; left alone"; continue; }
+  current+=$'\n'"$name=$(openssl rand -hex 32)"
+  added+=("$name")
+done
+[ ${#added[@]} -eq 0 ] && exit 0
+printf '%s\n' "$current" | "$sops" encrypt --input-type dotenv --output-type dotenv \
+  --filename-override secrets/gateway.env /dev/stdin > "$f.tmp"
+mv "$f.tmp" "$f"
+echo "added: ${added[*]}"

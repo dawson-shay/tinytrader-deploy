@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Rebuild and restart named services, then check each one came back.
+#   scripts/deploy [--force] SERVICE...     e.g. scripts/deploy console queue
+#   scripts/deploy store                    a native service (nix-darwin; asks for your password)
+#   scripts/deploy --remove SERVICE...      stop and remove containers moved to another host,
+#                                           or here from a container to native (launchd)
+#
+# Only services placed on this machine (the site's inventory.nix services, docs/decisions/0005;
+# scripts/placement host says which host this is). Refuses, unless --force:
+#   - a service placed on another host;
+#   - any build between 09:25 and 16:20 New York time on a weekday (builds take
+#     the CPU the live relays need; docs/architecture.md);
+#   - restarting a relay that is live (its clients would drop).
+# Secrets are decrypted into this command's environment only, as local-up.sh does.
+# Never the Databento key: no container holds it (docs/decisions/0013).
+# On a machine with deploy checkouts (docs/decisions/0012) it always
+# deploys from them: run from a working copy, it runs the deploy checkout's
+# scripts/deploy instead, so what is deployed is what is merged to main.
+#   TINYTRADER_SITE  the site (scripts/lib/site.sh; with deploy checkouts, theirs only)
+#   TINYTRADER_SRC   path to a tinytrader checkout (default: ../tinytrader beside
+#                    this repo; with deploy checkouts, theirs only)
+#   TINYTRADER_HOST  this machine's inventory host, if its name doesn't say
+set -euo pipefail
+# Nix's tools, whatever shell this runs from (a `!` shell has no login PATH).
+export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# shellcheck source=lib/deploy-root.sh
+. "$(dirname "$0")/lib/deploy-root.sh"
+deploy_root_exec "$0" "$@"
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+src="${TINYTRADER_SRC:-$stack/../tinytrader}"
+project="$(site_name)"
+# The console, wherever it is placed (its state says whether each service is
+# back): on its loopback port on its own host, else at its HTTPS tailnet
+# address (its raw port is localOnly).
+console="${CONSOLE_URL:-}"
+if [ -z "$console" ]; then
+  console="$("$stack/scripts/placement" endpoints native | sed -n "s/^export TT_URL_CONSOLE=//p")"
+  case "$console" in *.invalid:*) console="$("$stack/scripts/placement" endpoints native | sed -n "s/^export TT_HTTPS_URL_CONSOLE=//p")" ;; esac
+fi
+
+force=0
+remove=0
+services=()
+for a in "$@"; do
+  case "$a" in
+    --force) force=1 ;;
+    --remove) remove=1 ;;
+    -*) echo "unknown option $a" >&2; exit 2 ;;
+    *) services+=("$a") ;;
+  esac
+done
+[ ${#services[@]} -gt 0 ] || { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+# Each service's runtime, from the placement map (unknown services stop here).
+runtimes=()
+for s in "${services[@]}"; do
+  runtimes+=("$("$stack/scripts/placement" runtime "$s")")
+done
+host="$("$stack/scripts/placement" host)"
+
+# A relay that is live (its clients would drop).
+state() {
+  curl -fsS -m 5 "$console/api/state" 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)["services"].get(sys.argv[1], {})
+b = (s.get("health") or {}).get("body") or {}
+print(b.get("state", ""), "|", b.get("detail", ""))' "$1" 2>/dev/null || true
+}
+live_relay() {
+  [ "$force" = 0 ] && [[ "$1" == relay* ]] && [[ "$(state "$1")" == ready* ]]
+}
+
+# Moving a container away: on the host it leaves, stop and remove it.
+if [ "$remove" = 1 ]; then
+  for i in "${!services[@]}"; do
+    s="${services[$i]}"
+    # A service now native here (launchd, as the Databento key's holders,
+    # decision 0013) may still have its old container: that goes. A native
+    # service with no container is the role module's to remove.
+    if [ "${runtimes[$i]}" != compose ]; then
+      if [ -z "$(docker ps -aq --filter label=com.docker.compose.project=$project --filter "label=com.docker.compose.service=$s")" ]; then
+        echo "$s is not a container (${runtimes[$i]}) and has none here: remove it from this host's role module instead." >&2
+        exit 1
+      fi
+    elif "$stack/scripts/placement" check "$s" 2>/dev/null && [ "$force" = 0 ]; then
+      echo "$s is placed on this host ($host); --remove is for services moved away (--force to remove it anyway)." >&2
+      exit 1
+    fi
+    if live_relay "$s"; then
+      echo "$s is live (clients would drop); remove it when it is idle, or pass --force." >&2
+      exit 1
+    fi
+  done
+  for s in "${services[@]}"; do
+    ids=$(docker ps -aq --filter label=com.docker.compose.project=$project --filter "label=com.docker.compose.service=$s")
+    if [ -z "$ids" ]; then echo "$s: no container here"; continue; fi
+    # Stopped first (SIGTERM, 20 s), so a relay closes its provider session.
+    # shellcheck disable=SC2086
+    docker stop -t 20 $ids >/dev/null && docker rm $ids >/dev/null && echo "$s: stopped and removed here"
+  done
+  exit 0
+fi
+
+# Only what is placed here.
+if [ "$force" = 1 ]; then
+  "$stack/scripts/placement" check --force "${services[@]}"
+elif ! "$stack/scripts/placement" check "${services[@]}"; then
+  echo "(on the host a service moved away from, scripts/deploy --remove SERVICE stops it there)" >&2
+  exit 1
+fi
+for i in "${!services[@]}"; do
+  if [ "${runtimes[$i]}" = systemd ]; then
+    echo "${services[$i]} runs under systemd: deploy it with nixos-rebuild on its host (its role module, e.g. modules/nas.nix)." >&2
+    exit 1
+  fi
+done
+
+# Market hours: 09:25-16:20 New York time, Monday to Friday.
+if [ "$force" = 0 ]; then
+  hm=$(TZ=America/New_York date +%H%M); dow=$(TZ=America/New_York date +%u)
+  if [ "$dow" -le 5 ] && [ "$hm" -ge 0925 ] && [ "$hm" -lt 1620 ]; then
+    echo "It's $(TZ=America/New_York date +%H:%M) ET on a weekday: no builds during market hours (--force to override)." >&2
+    exit 1
+  fi
+fi
+
+containers=()
+native=()
+for i in "${!services[@]}"; do
+  s="${services[$i]}"
+  if [ "${runtimes[$i]}" = launchd ]; then native+=("$s"); continue; fi
+  if live_relay "$s"; then
+    echo "$s is live (clients would drop); deploy it when it is idle, or pass --force." >&2
+    exit 1
+  fi
+  containers+=("$s")
+done
+
+# Native services: applying this Mac's nix-darwin configuration (re)starts them.
+if [ ${#native[@]} -gt 0 ]; then
+  echo "== ${native[*]} (native)"
+  "$stack/scripts/darwin-switch"
+fi
+if printf '%s\n' "${native[@]+"${native[@]}"}" | grep -qx store; then
+  store_url="$("$stack/scripts/placement" endpoints native | sed -n "s/^export TT_URL_STORE=//p")"
+  # /health answers 503 while not ready (degraded, starting): read its state either way.
+  got=""
+  for _ in $(seq 1 60); do
+    got=$(curl -sS -m 2 "$store_url/health" 2>/dev/null | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["state"], "|", h.get("detail",""))' 2>/dev/null || true)
+    case "$got" in ready*|idle*|degraded*) break ;; esac
+    sleep 2
+  done
+  printf '%-18s %s\n' store "${got:-NOT BACK}"
+  case "$got" in ready*|idle*|degraded*) ;; *) exit 1 ;; esac
+fi
+
+[ ${#containers[@]} -gt 0 ] || exit 0
+test -x "$src/nix/build-images.sh" || { echo "tinytrader checkout not found at $src (set TINYTRADER_SRC)" >&2; exit 1; }
+export TINYTRADER_SRC="$(cd "$src" && pwd)"
+# The console's reminders and curated views, bind-mounted writable from the
+# site (state/console, decision 0009): Docker would make an empty folder
+# in its place, and the console would start with no reminders.
+test -f "$site/state/console/reminders.json" || { echo "no state/console/reminders.json in $site (state/console/README.md)" >&2; exit 1; }
+# The console's topology, with the placement map (deploy/local/topology.nix).
+export TINYTRADER_TOPOLOGY="${XDG_STATE_HOME:-$HOME/.local/state}/$project/topology.json"
+"$stack/scripts/placement" topology "$TINYTRADER_TOPOLOGY"
+# Where this host's containers reach each service (TT_ADDR_*, TT_URL_*), from
+# the placement map (deploy/local/endpoints.nix, docs/decisions/0008).
+eval "$("$stack/scripts/placement" endpoints)"
+set -a
+[ -e "$site/secrets/econ.env" ] && eval "$(sops decrypt "$site/secrets/econ.env")"
+# The notebook server's token.
+[ -e "$site/secrets/research.env" ] && eval "$(sops decrypt "$site/secrets/research.env")"
+[ -e "$site/secrets/gateway.env" ] && eval "$(sops decrypt "$site/secrets/gateway.env")"
+# The console's push notices: the ntfy topic URL from notify.env, when it
+# exists (secrets/README.md); without it the console sends none.
+if [ -e "$site/secrets/notify.env" ]; then
+  CONSOLE_NOTIFY="$(sops decrypt "$site/secrets/notify.env" | sed -n 's/^NTFY_URL=//p' | head -n1)" \
+    || echo "secrets/notify.env: could not decrypt it; the console sends no notices" >&2
+  export CONSOLE_NOTIFY
+fi
+# The console's trading token until the operator adds it (scripts/gateway-token
+# GATEWAY_CONSOLE_TOKEN): empty, so the console starts with trading off.
+export GATEWAY_CONSOLE_TOKEN="${GATEWAY_CONSOLE_TOKEN:-}"
+# The store's write token (decision 0008), for the console (databento-jobs, native, has its own copy):
+# empty until the operator makes secrets/store.env, and the store requires it
+# only once its own role has it.
+[ -e "$site/secrets/store.env" ] && eval "$(sops decrypt "$site/secrets/store.env")"
+export STORE_WRITE_TOKEN="${STORE_WRITE_TOKEN:-}"
+# The console's write gate (docs/operations.md): its order token and the
+# Tailscale logins allowed to make changes. Without them the console starts
+# with every write refused.
+[ -e "$site/secrets/console.env" ] && eval "$(sops decrypt "$site/secrets/console.env")"
+export CONSOLE_ORDER_TOKEN="${CONSOLE_ORDER_TOKEN:-}" CONSOLE_ORDER_LOGINS="${CONSOLE_ORDER_LOGINS:-}"
+# The purchase approval token (tinytrader decision 0019), for the console;
+# empty until console.env has it: purchases then wait for it.
+export CONSOLE_JOBS_APPROVE_TOKEN="${CONSOLE_JOBS_APPROVE_TOKEN:-}"
+for f in "$site"/secrets/accounts/*.env; do
+  [ -e "$f" ] || continue
+  n="$(basename "$f" .env | tr 'a-z-' 'A-Z_')"
+  eval "$(sops decrypt "$f" | sed -nE "s/^APCA_API_(KEY_ID|SECRET_KEY)=/ACCOUNT_${n}_\1=/p")"
+done
+set +a
+compose=(docker compose -f "$site/deploy/local/compose.yaml")
+started=$(date -u +%Y-%m-%dT%H:%M:%S)
+# The images these services run (several relays share one), built by Nix.
+images=$("${compose[@]}" config --format json | python3 -c '
+import json, sys
+c = json.load(sys.stdin)["services"]
+print(" ".join(sorted({c[s]["image"].split("/")[1].split(":")[0] for s in sys.argv[1:] if c[s]["image"].startswith("tinytrader/")})))' "${containers[@]}")
+echo "== building images: $images"
+# shellcheck disable=SC2086
+[ -z "$images" ] || "$src/nix/build-images.sh" $images
+# Images this deployment builds itself (the research notebooks).
+own=$("${compose[@]}" config --format json | python3 -c '
+import json, sys
+c = json.load(sys.stdin)["services"]
+print(" ".join(s for s in sys.argv[1:] if c[s].get("build")))' "${containers[@]}")
+# shellcheck disable=SC2086
+[ -z "$own" ] || "${compose[@]}" build $own
+# Always recreate: an unchanged image would otherwise leave the old container running.
+"${compose[@]}" up -d --no-deps --force-recreate "${containers[@]}"
+
+echo "== checking"
+# Give the console a couple of polls to see the new containers.
+sleep 6
+fail=0
+# Services without tinytrader's health endpoints are checked as containers.
+unobserved=$("${compose[@]}" config --format json | python3 -c '
+import json, sys
+c = json.load(sys.stdin)["services"]
+print(" ".join(s for s, v in c.items() if "tinytrader.observe" not in (v.get("labels") or {})))')
+for s in "${containers[@]}"; do
+  created=$("${compose[@]}" ps --format '{{.CreatedAt}}' "$s" 2>/dev/null | head -1)
+  got=""
+  for _ in $(seq 1 45); do
+    if [[ " $unobserved " == *" $s "* ]]; then
+      got=$("${compose[@]}" ps --format '{{.State}}' "$s" 2>/dev/null | head -1)
+      [ "$got" = running ] && got="ready | container running (no health endpoints)"
+    else
+      got=$(state "$s")
+    fi
+    case "$got" in ready*|idle*|degraded*) break ;; esac
+    sleep 2
+  done
+  case "$got" in
+    ready*|idle*|degraded*) printf '%-18s %s   (container %s)\n' "$s" "$got" "${created:-?}" ;;
+    *) printf '%-18s NOT BACK: %s\n' "$s" "${got:-no answer}"; fail=1 ;;
+  esac
+done
+echo "(started $started UTC)"
+exit $fail

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# The lint half of CI (docs/ci.md), shared by .github/workflows/ci.yml and the
+# pre-push hook: every script under scripts/ parses (bash -n, or Python's
+# parser for *.py), and every compose file parses.
+#   scripts/ci-lint          this repository
+#   scripts/ci-lint DIR      another repository: a site's (its scripts/ and compose files)
+# Runs its tools from this flake's nixpkgs (bash 5, python3, docker-compose),
+# so it behaves the same on any machine with Nix and needs no Docker engine.
+set -euo pipefail
+stack="$(cd "$(dirname "$0")/.." && pwd)"
+dir="$(cd "${1:-$stack}" && pwd)"
+
+if [ -z "${CI_LINT_SHELL:-}" ]; then
+  export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:$PATH"
+  exec env CI_LINT_SHELL=1 nix shell --inputs-from "$stack" \
+    nixpkgs#bash nixpkgs#python3 nixpkgs#docker-compose \
+    --command bash "$0" "$@"
+fi
+cd "$dir"
+
+status=0
+for f in scripts/* scripts/*/*; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *.py) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" || status=1 ;;
+    *.md | *.json | *.yaml | *.nix) ;;
+    *) bash -n "$f" || status=1 ;;
+  esac
+done
+[ "$status" -eq 0 ] && echo "ci-lint: scripts parse"
+
+while read -r f; do
+  if docker-compose -f "$f" config --quiet --no-interpolate; then
+    echo "ci-lint: $f parses"
+  else
+    status=1
+  fi
+done < <(git ls-files '*compose.yaml' '*compose.yml' '*compose.*.yaml')
+
+exit "$status"

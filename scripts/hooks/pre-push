@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Runs CI's checks on each commit being pushed, and refuses the push if any
+# fails (docs/ci.md): `nix flake check` and scripts/ci-lint (scripts and
+# compose files parse). Installed by scripts/install-hooks. A site uses the
+# same hook: its scripts/hooks/pre-push runs this one (TINYTRADER_DEPLOY, or
+# the tinytrader-deploy checkout beside it), and ci-lint checks the site.
+#   git push --no-verify    skip it, for one push
+# It checks the pushed commits themselves, in a temporary worktree, so
+# uncommitted changes neither help nor hurt.
+set -euo pipefail
+export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:/run/current-system/sw/bin:$PATH"
+# Git runs hooks from the repository's top level; the checks below run in a
+# worktree of their own, so they must not inherit this one's Git variables.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+lint="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ci-lint"
+
+# The commits to check: each pushed ref's new tip (none when only deleting).
+shas=()
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_sha" in *[!0]*) shas+=("$local_sha") ;; esac
+done
+[ "${#shas[@]}" -gt 0 ] || exit 0
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/pre-push.XXXXXX")"
+cleanup() {
+  git worktree remove --force "$tmp/tree" >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "pre-push: $1 failed for ${sha:0:12}; push refused (git push --no-verify skips this check)" >&2
+  exit 1
+}
+for sha in $(printf '%s\n' "${shas[@]}" | sort -u); do
+  git worktree add --quiet --detach "$tmp/tree" "$sha"
+  echo "pre-push: nix flake check (${sha:0:12})" >&2
+  (cd "$tmp/tree" && nix flake check --keep-going) >&2 || fail "nix flake check"
+  echo "pre-push: scripts/ci-lint (${sha:0:12})" >&2
+  "$lint" "$tmp/tree" >&2 || fail "scripts/ci-lint"
+  git worktree remove --force "$tmp/tree"
+done
+echo "pre-push: checks passed" >&2

@@ -1,0 +1,45 @@
+# Continuous integration: every push and pull request, on GitHub-hosted
+# runners (docs/ci.md). `nix flake check` evaluates and checks the example
+# site (example/) with every module, role and check a real site gets, and
+# checks.generic fails on anything deployment-specific; scripts/ci-lint
+# checks that the scripts and compose files parse. The pre-push hook
+# (scripts/hooks/pre-push) runs the same before a push.
+#
+# Never a self-hosted runner: this repository is public, and anyone's pull
+# request would run on it.
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v31
+      - name: nix flake check
+        run: nix flake check --keep-going --print-build-logs
+      - name: Evaluate the example roles
+        run: |
+          nix eval --raw .#darwinModules --apply 'm: builtins.concatStringsSep " " (builtins.attrNames m)'
+          echo
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v31
+      - name: Scripts and compose files parse
+        run: scripts/ci-lint

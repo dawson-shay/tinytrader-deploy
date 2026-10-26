@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Forward this host's service ports from the tailnet to their loopback
+# listeners, with `tailscale serve`: every port of every service placed here
+# but the localOnly ones (docs/decisions/0008, 0010). Nothing
+# here listens beyond loopback; tailscaled listens on the tailnet address
+# only, where the tailnet policy (tailscale/policy.hujson) decides who
+# connects. The site is scripts/lib/site.sh's (TINYTRADER_SITE).
+#   scripts/tailnet-serve           show what would change; change nothing
+#   scripts/tailnet-serve --apply   add the forwards the placement map wants, and
+#                                   remove those of service ports it no longer wants
+# What is wanted: `scripts/placement serve` (deploy/local/endpoints.nix's
+# serve.<host>). Other serve settings (such as the console's HTTPS on 443)
+# are left alone. The settings persist in tailscaled across restarts.
+#   TINYTRADER_HOST  this machine's inventory host, if its name doesn't say
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH"
+apply=0
+[ "${1:-}" = --apply ] && apply=1
+
+host="$("$stack/scripts/placement" host)"
+want="$("$stack/scripts/placement" serve)"
+# Only ports a service of this deployment may use are ever removed.
+ours="$(stack_eval deploy/local/endpoints.nix --json --apply 'e: e.aclPorts' | python3 -c 'import json,sys; print(" ".join(map(str, json.load(sys.stdin))))')"
+# The localOnly services' ports, which must never be forwarded (the checks
+# refuse it too): the order gateways', the Docker proxies', the console's raw
+# port (it is reached over HTTPS on 443, a serve setting left alone here).
+never="$(stack_eval deploy/local/endpoints.nix --json --apply 'e: e.localOnlyPorts' | python3 -c 'import json,sys; print(" ".join(map(str, json.load(sys.stdin))))')"
+command -v tailscale >/dev/null || { echo "tailscale CLI not found" >&2; exit 1; }
+have="$(tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    tcp = (json.load(sys.stdin) or {}).get("TCP") or {}
+except ValueError:
+    tcp = {}
+for port, h in sorted(tcp.items(), key=lambda kv: int(kv[0])):
+    print(port, h.get("TCPForward", ""))' || true)"
+
+changes=0
+while read -r port svc; do
+  [ -n "$port" ] || continue
+  if [[ " $never " == *" $port "* ]]; then
+    echo "refusing $port ($svc): a localOnly port (an order gateway's, say) is never forwarded" >&2; exit 1
+  fi
+  if grep -qx "$port 127.0.0.1:$port" <<<"$have"; then
+    echo "ok      tcp:$port -> 127.0.0.1:$port ($svc)"
+    continue
+  fi
+  changes=1
+  echo "add     tcp:$port -> 127.0.0.1:$port ($svc)"
+  [ "$apply" = 1 ] && tailscale serve --bg --tcp "$port" "tcp://127.0.0.1:$port" >/dev/null
+done <<<"$want"
+while read -r port target; do
+  [ -n "$port" ] || continue
+  [[ " $ours $never " == *" $port "* ]] || continue
+  grep -q "^$port " <<<"$want" && continue
+  changes=1
+  if [[ " $never " == *" $port "* ]]; then
+    echo "remove  tcp:$port -> $target (a localOnly port, such as an order gateway's or the console's: never forwarded)"
+  else
+    echo "remove  tcp:$port -> $target (no service placed here has it now)"
+  fi
+  [ "$apply" = 1 ] && tailscale serve --tcp "$port" off >/dev/null
+done <<<"$have"
+
+if [ "$changes" = 0 ]; then
+  echo "$host: nothing to change"
+elif [ "$apply" = 0 ]; then
+  echo "$host: run with --apply to make these changes"
+fi

@@ -1,0 +1,62 @@
+{
+  "name": "local",
+  "focus": "relay-opra-spy",
+  "panels": [
+    {
+      "service": "relay-iex",
+      "source": "recent",
+      "heading": "Equities (IEX)",
+      "note": "SPY trade prices, sampled once per second",
+      "title": "{key}",
+      "decimals": 2
+    },
+    {
+      "service": "relay-opra-spy",
+      "source": "recent",
+      "heading": "SPY options",
+      "note": "Trade prices of the most active instruments, sampled once per second",
+      "title": "{key}",
+      "decimals": 2
+    }
+  ],
+  "hide": [
+    "docker-proxy",
+    "queue-docker-proxy"
+  ],
+  "edges": [
+    {
+      "from": "databento-jobs",
+      "to": "store",
+      "kind": "flow",
+      "label": "batch files"
+    }
+  ],
+  "bundles": [
+    {
+      "name": "OPRA capture",
+      "class": "capture",
+      "members": [
+        "relay-opra-spy"
+      ],
+      "note": "Live OPRA options feeds, read in real time; background work yields to them. Hours: the inventory's deployment.captureHours."
+    },
+    {
+      "name": "US market day",
+      "class": "interactive",
+      "members": [
+        "relay-iex",
+        "accounts"
+      ],
+      "note": "IEX prices and the account session: live but light, so nothing yields to them."
+    },
+    {
+      "name": "Background work",
+      "class": "background",
+      "members": [
+        "databento-jobs",
+        "queue"
+      ],
+      "note": "Downloads and queued jobs: they yield to live capture and run at a low CPU share."
+    }
+  ]
+}

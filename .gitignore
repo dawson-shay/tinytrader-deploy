@@ -1,0 +1,12 @@
+result
+result-*
+.direnv/
+.DS_Store
+
+# sops-encrypted secrets are safe to commit; checks.<system>.secrets-encrypted enforces it.
+!secrets/**/*.env
+__pycache__/
+
+# The console's saves in progress (state/console/README.md).
+state/**/*.tmp
+.venv/

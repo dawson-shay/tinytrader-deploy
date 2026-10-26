@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Read or change the site's secrets/databento.yaml, the Databento key and
+# databento-jobs' purchase approval token (docs/decisions/0013). It is
+# encrypted to its host's SSH host key and the recovery key only, never the
+# operator key (inventory.nix secrets.hostOnly), so this runs sops as root
+# (sudo, your password) with the host key, on that host.
+#   scripts/databento-key edit         open it in $EDITOR (DATABENTO_API_KEY, JOBS_APPROVE_TOKEN)
+#   scripts/databento-key set NAME     replace one value, read from the terminal without echo
+#   scripts/databento-key keys         the names it holds (never the values)
+#   scripts/databento-key updatekeys   re-encrypt it to .sops.yaml's recipients (after
+#                                      scripts/secrets-recipients changed them)
+# Without that host (or its host key): the recovery key, from where it is kept
+# offline, with SOPS_AGE_KEY_FILE=<file with it> sops edit secrets/databento.yaml.
+# The file stays yours (it is chowned back after sops writes it). Then commit,
+# merge, and on the host apply its role (in your machines repository: update
+# the site input, then switch): sops-nix writes the new values to
+# /run/secrets, and after hours restart what reads them:
+#   sudo launchctl kickstart -k system/com.tinytrader.databento-jobs
+#   sudo launchctl kickstart -k system/com.tinytrader.relay-opra-spy   (and -xsp)
+# Agents never run this: it is the operator's, at the terminal.
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+file="$site/secrets/databento.yaml"
+host_key=/etc/ssh/ssh_host_ed25519_key
+export PATH="/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:$PATH"
+
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+[ $# -ge 1 ] || usage
+cmd="$1"
+shift
+
+[ -f "$file" ] || { echo "databento-key: no $file" >&2; exit 1; }
+[ -e "$host_key.pub" ] || { echo "databento-key: no $host_key.pub: run it on the host that holds it (or use the recovery key, above)" >&2; exit 1; }
+want="$(ssh-to-age < "$host_key.pub")"
+grep -qF "$want" "$file" || { echo "databento-key: this Mac's host key ($want) is not a recipient of secrets/databento.yaml: run it on the host that holds it" >&2; exit 1; }
+
+# sops as root with the host key only (no operator key, no root's own).
+as_root() {
+  sudo -H env SOPS_AGE_SSH_PRIVATE_KEY_FILE="$host_key" SOPS_AGE_KEY_FILE=/dev/null \
+    EDITOR="${EDITOR:-vi}" "$(command -v sops)" "$@"
+}
+mine() { sudo chown "$(id -u):$(id -g)" "$file"; }
+
+cd "$site"
+case "$cmd" in
+  edit)
+    as_root edit "$file" || { mine; exit 1; }
+    mine
+    ;;
+  set)
+    name="${1:-}"
+    case "$name" in DATABENTO_API_KEY | JOBS_APPROVE_TOKEN) ;; *) echo "databento-key: set DATABENTO_API_KEY or JOBS_APPROVE_TOKEN" >&2; exit 2 ;; esac
+    # sudo first, so its password prompt isn't mistaken for the value's.
+    sudo -v
+    printf '%s (not echoed): ' "$name" >&2
+    IFS= read -rs value
+    echo >&2
+    [ -n "$value" ] || { echo "databento-key: empty; nothing changed" >&2; exit 1; }
+    # As a JSON string on stdin: never on a command line.
+    printf '%s' "$value" | python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.stdin.read()))' \
+      | as_root set --value-stdin "$file" "[\"$name\"]" || { unset value; mine; exit 1; }
+    unset value
+    mine
+    echo "set $name in secrets/databento.yaml: commit it, then apply its host's role (above)" >&2
+    ;;
+  keys)
+    as_root decrypt --output-type json "$file" | python3 -c 'import json, sys; print("\n".join(json.load(sys.stdin)))'
+    ;;
+  updatekeys)
+    as_root updatekeys --yes "$file" || { mine; exit 1; }
+    mine
+    ;;
+  *) usage ;;
+esac

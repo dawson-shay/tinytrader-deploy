@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# What runs where, from the site's inventory.nix `services` (docs/decisions/0005).
+#   scripts/placement host                  this machine's inventory host
+#   scripts/placement services [RUNTIME]    the services placed on it (optionally of one runtime)
+#   scripts/placement check [--force] SVC…  fail, saying where, unless each runs here
+#   scripts/placement runtime SVC           its runtime: compose, launchd or systemd (here, for a host agent)
+#   scripts/placement topology FILE         write the console's topology file
+#   scripts/placement endpoints [native]    this host's service addresses, as export lines: for
+#                                           compose.yaml, or for a native client (deploy/local/endpoints.nix)
+#   scripts/placement serve                 what this host forwards from the tailnet (port service)
+# This machine is TINYTRADER_HOST if set, else the inventory host whose name
+# or tailnet name is this machine's LocalHostName (macOS) or short hostname,
+# case aside. The site is scripts/lib/site.sh's (TINYTRADER_SITE).
+set -euo pipefail
+export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:$PATH"
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+
+inventory() { nix eval --json --file "$site/inventory.nix"; }
+# deploy/local/endpoints.nix on the site's inventory, with APPLY applied.
+endpoints() { stack_eval deploy/local/endpoints.nix --json --apply "$1"; }
+
+# Python: each service's {host: runtime} (a host agent, `perHost`, has several).
+PLACES='
+def places(s):
+    return s["perHost"] if "perHost" in s else {s["host"]: s["runtime"]}
+'
+
+machine() {
+  if [ "$(uname -s)" = Darwin ]; then scutil --get LocalHostName; else hostname -s; fi
+}
+
+this_host() {
+  inventory | python3 -c '
+import json, os, sys
+inv = json.load(sys.stdin)
+name = os.environ.get("TINYTRADER_HOST") or sys.argv[1]
+want = name.lower()
+for h, v in inv["hosts"].items():
+    if want in (h.lower(), str(v.get("tailnetName", "")).lower()):
+        print(h)
+        sys.exit(0)
+how = "TINYTRADER_HOST" if os.environ.get("TINYTRADER_HOST") else "this machine (%s)" % name
+sys.exit("%s is no host in inventory.nix (one of: %s); set TINYTRADER_HOST to its name"
+         % (how, ", ".join(inv["hosts"])))' "$(machine)"
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  host) this_host ;;
+  services)
+    host="$(this_host)"
+    inventory | python3 -c "$PLACES"'
+import json, sys
+host, runtime = sys.argv[1], sys.argv[2]
+for n, s in sorted(json.load(sys.stdin)["services"].items()):
+    p = places(s)
+    if host in p and runtime in ("", p[host]):
+        print(n)' "$host" "${1:-}" ;;
+  check)
+    force=0
+    [ "${1:-}" = --force ] && { force=1; shift; }
+    host="$(this_host)"
+    inventory | python3 -c "$PLACES"'
+import json, sys
+host, force, names = sys.argv[1], sys.argv[2] == "1", sys.argv[3:]
+services = json.load(sys.stdin)["services"]
+bad = 0
+for n in names:
+    s = services.get(n)
+    if s is None:
+        print("%s is not in inventory.nix services" % n, file=sys.stderr); bad = 1
+    elif host not in places(s):
+        on = ", ".join(places(s))
+        if force:
+            print("%s runs on %s, not %s: going ahead (--force)" % (n, on, host), file=sys.stderr)
+        else:
+            print("%s runs on %s, not here (%s): deploy it there, or move it in inventory.nix (services.%s.host); --force to override"
+                  % (n, on, host, n), file=sys.stderr); bad = 1
+sys.exit(bad)' "$host" "$force" "$@" ;;
+  runtime)
+    svc="${1:?usage: scripts/placement runtime SVC}"
+    # A host agent's runtime is this host's (or, placed elsewhere, its first).
+    host="$(this_host 2>/dev/null || true)"
+    inventory | python3 -c "$PLACES"'
+import json, sys
+s = json.load(sys.stdin)["services"].get(sys.argv[1])
+if s is None:
+    sys.exit("%s is not in inventory.nix services" % sys.argv[1])
+p = places(s)
+print(p.get(sys.argv[2]) or next(iter(p.values())))' "$svc" "$host" ;;
+  topology)
+    out="${1:?usage: scripts/placement topology FILE}"
+    # With the site's deploy/local/topology.json (panels, bundles, links), if it has one.
+    json="$(stack_eval deploy/local/topology.nix --json)"
+    mkdir -p "$(dirname "$out")"
+    # Rewritten in place, not replaced, so a bind mount of it sees the change.
+    printf '%s\n' "$json" > "$out" ;;
+  endpoints)
+    # The TT_ADDR_* and TT_URL_* compose.yaml is interpolated with here
+    # (docs/decisions/0008), for `eval` before docker compose.
+    host="$(this_host)"
+    view=compose
+    [ "${1:-}" = native ] && view=native
+    endpoints "e: e.$view.\"$host\" or { }" | python3 -c '
+import json, shlex, sys
+for k, v in sorted(json.load(sys.stdin).items()):
+    print("export %s=%s" % (k, shlex.quote(v)))' ;;
+  serve)
+    host="$(this_host)"
+    endpoints "e: e.serve.\"$host\" or [ ]" | python3 -c '
+import json, sys
+for s in json.load(sys.stdin):
+    print(s["port"], s["service"])' ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

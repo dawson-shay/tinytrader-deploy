@@ -1,0 +1,821 @@
+#!/usr/bin/env bash
+# Deploy what was merged to main, automatically (docs/decisions/0011). Run
+# every 5 minutes on a services host by launchd when
+# tinytrader-deploy.autoDeploy.enable is on (modules/auto-deploy-darwin.nix);
+# can be run by hand.
+#   scripts/auto-deploy                   fetch, fast-forward, deploy what changed
+#   scripts/auto-deploy --dry-run         say what it would do; change nothing
+#   scripts/auto-deploy --scheduled       as launchd runs it: quiet when idle, no retry of a failure
+#   scripts/auto-deploy --retry           with --scheduled, try again what failed last time
+#   scripts/auto-deploy --since-tinytrader REV / --since-stack REV / --since-site REV
+#                                         count changes from REV, not from the last deploy
+#   scripts/auto-deploy --mark-deployed   fetch and fast-forward, then record what is checked
+#                                         out as deployed, deploying nothing (after a change
+#                                         known to need no deploy, such as moving files)
+# It acts on the deploy checkouts (docs/decisions/0012):
+# <TINYTRADER_DEPLOY_ROOT>/{<site>,tinytrader-deploy,tinytrader}
+# (nix-darwin's tinytrader-deploy.deployRoot), clones that nothing else
+# changes; run from a working copy, it runs theirs instead.
+# First the console's state (the site's state/console: reminders.json,
+# layouts.json and journal.json, decision 0009): changes are committed as you
+# ("Console state: ...") and pushed to the site's main, rebased onto it if
+# main moved, never forced; a conflict stops the run, notified, with the
+# edits kept. Then for tinytrader (../tinytrader, TINYTRADER_SRC), the site
+# and this stack: fetch and fast-forward (to origin/main; this stack to the
+# commit the site's flake.lock pins), only when on main with no tracked
+# changes (the console's own writes in the site aside), never forcing.
+# Then `scripts/deploy` the containers placed here that the new commits
+# affect. Never those matching AUTO_DEPLOY_NEVER (default: the site's
+# inventory.nix deployment.autoDeploy.never, else order gateways and relays):
+# those are notified as needing a manual deploy. Only outside 09:25-16:20 New
+# York time on weekdays (scripts/deploy's guard), and no start after 09:00.
+#   AUTO_DEPLOY_SITE  the site checkout to act on (default: the deploy
+#                     checkout, or scripts/lib/site.sh's where there is none)
+#   ~/.config/tinytrader/auto-deploy.off       kill switch: while it exists, do nothing
+#   ~/.local/state/<deployment>/auto-deploy.json   what was deployed, when, from which commits
+#   ~/Library/Logs/tinytrader/auto-deploy.log      the log
+# Notices go to the site's secrets/notify.env NTFY_URL, as the monitor's do.
+set -euo pipefail
+# shellcheck source=lib/deploy-root.sh
+. "$(dirname "$0")/lib/deploy-root.sh"
+
+main() {
+  export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:/run/current-system/sw/bin:$PATH"
+  if [ -n "${AUTO_DEPLOY_SITE:-}" ]; then
+    export TINYTRADER_SITE="$AUTO_DEPLOY_SITE"
+  else
+    deploy_root_exec "$0" "$@"
+  fi
+  # shellcheck source=lib/site.sh
+  . "$(dirname "$0")/lib/site.sh"
+  src="${TINYTRADER_SRC:-$stack/../tinytrader}"
+  project="$(site_name)"
+  state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/$project"
+  state_file="$state_dir/auto-deploy.json"
+  lock_file="$state_dir/auto-deploy.lock"
+  log_file="${AUTO_DEPLOY_LOG:-$HOME/Library/Logs/tinytrader/auto-deploy.log}"
+  off_file="${XDG_CONFIG_HOME:-$HOME/.config}/tinytrader/auto-deploy.off"
+  never="${AUTO_DEPLOY_NEVER:-$(nix eval --raw --file "$site/inventory.nix" --apply 'i: builtins.concatStringsSep " " (i.deployment.autoDeploy.never or [ "order-gateway-*" "relay-*" ])')}"
+  export GIT_TERMINAL_PROMPT=0
+
+  dry=0 scheduled=0 retry=0 mark=0 since_tt="" since_stack="" since_site=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --scheduled) scheduled=1 ;;
+      --retry) retry=1 ;;
+      --mark-deployed) mark=1 ;;
+      --since-tinytrader) since_tt="${2:?--since-tinytrader REV}"; shift ;;
+      --since-stack) since_stack="${2:?--since-stack REV}"; shift ;;
+      --since-site) since_site="${2:?--since-site REV}"; shift ;;
+      -h|--help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; return 0 ;;
+      *) echo "unknown option $1" >&2; return 2 ;;
+    esac
+    shift
+  done
+  test -d "$src/.git" || test -f "$src/.git" || { echo "tinytrader checkout not found at $src (set TINYTRADER_SRC)" >&2; return 1; }
+  src="$(cd "$src" && pwd)"
+  mkdir -p "$state_dir" "$(dirname "$log_file")"
+  # By hand, the log gets a copy (a scheduled run's output is the log: launchd).
+  if [ "$dry" = 0 ] && [ "$scheduled" = 0 ]; then
+    exec > >(tee -a "$log_file") 2>&1
+  fi
+
+  if [ -e "$off_file" ]; then
+    if [ "$dry" = 0 ]; then say "kill switch $off_file is on: doing nothing"; return 0; fi
+    log "(dry run) kill switch $off_file is on: a real run would do nothing"
+  fi
+  if ! window; then
+    if [ "$dry" = 0 ]; then say "$why_closed"; return 0; fi
+    log "(dry run) $why_closed: a real run would do nothing now"
+  fi
+
+  # One run at a time: the lock is held while fd 9 is open, released on exit.
+  if [ "$dry" = 0 ]; then
+    exec 9>>"$lock_file"
+    if ! python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2>/dev/null; then
+      say "another auto-deploy is running: skipping"
+      return 0
+    fi
+  fi
+
+  problems=""
+  # The console's edits first, so the fast-forward never meets them.
+  console_state
+  repo tt "$src" "" "$since_tt"
+  repo site "$site" "state/console/" "$since_site"
+  # This stack goes to the commit the site pins (its flake.lock, at what is
+  # deployed next), not to its own main: the site takes a new stack by
+  # updating its lock, reviewed like any change to it. A site without the
+  # input (none pinned) follows origin/main.
+  stack_pin="$(git -C "$site" show "$site_to:flake.lock" 2>/dev/null |
+    jq -r '.nodes as $n | ($n.root.inputs["tinytrader-deploy"] // empty) as $k | ($n[$k].locked.rev // empty)' 2>/dev/null || true)"
+  repo stack "$stack" "" "$since_stack" "$stack_pin"
+
+  # Nothing new and nothing in the way (the deploy checkouts are no one's
+  # working copy: anything in the way is reported, even with nothing new).
+  if [ -z "$problems" ] && [ "$tt_from" = "$tt_to" ] && [ "$stack_from" = "$stack_to" ] && [ "$site_from" = "$site_to" ]; then
+    say "nothing new (tinytrader ${tt_to:0:12}, tinytrader-deploy ${stack_to:0:12}, $project ${site_to:0:12})"
+    [ "$dry" = 1 ] || record baseline
+    return 0
+  fi
+  if [ -n "$problems" ]; then skip; [ "$scheduled" = 1 ] && return 0 || return 1; fi
+  if [ "$dry" = 0 ] && [ "$scheduled" = 1 ] && [ "$retry" = 0 ] &&
+    [ "$(state_get failed)" = "$tt_to $stack_to $site_to" ]; then
+    return 0   # failed already (notified): wait for new commits, or --retry
+  fi
+
+  # Fast-forward (never anything else; git refuses if a local change is in the way).
+  for r in tt stack site; do
+    eval "path=\$${r}_path ff=\$${r}_ff to=\$${r}_to"
+    [ "$ff" = 1 ] || continue
+    if [ "$dry" = 1 ]; then
+      log "(dry run) would fast-forward $path to ${to:0:12}"
+    elif ! out="$(git -C "$path" merge --ff-only --quiet "$to" 2>&1)"; then
+      problems="${problems} $(name "$r"): fast-forward refused (${out//$'\n'/ });"
+    else
+      log "fast-forwarded $path to ${to:0:12}"
+    fi
+  done
+  if [ -n "$problems" ]; then skip; [ "$scheduled" = 1 ] && return 0 || return 1; fi
+  if [ "$mark" = 1 ]; then
+    if [ "$dry" = 1 ]; then log "(dry run) would record $(ranges) as deployed, deploying nothing"; return 0; fi
+    deploy="" record nothing "marked deployed by hand"
+    log "recorded as deployed, nothing deployed: $(ranges)"
+    return 0
+  fi
+  log "new: $(ranges)"
+
+  # Which services the new commits change, and which of them it may deploy.
+  plan_file="$(mktemp "${TMPDIR:-/tmp}/auto-deploy-plan.XXXXXX")"
+  trap 'rm -f "$plan_file" "${out_file:-}"' EXIT
+  eligible="$("$stack/scripts/placement" services compose | tr '\n' ' ')"
+  if ! SITE="$site" STACK="$stack" SRC="$src" PROJECT="$project" TT_FROM="$tt_from" TT_TO="$tt_to" \
+    STACK_FROM="$stack_from" STACK_TO="$stack_to" SITE_FROM="$site_from" SITE_TO="$site_to" \
+    ELIGIBLE="$eligible" NEVER="$never" PLAN="$plan_file" python3 -c "$PLAN_PY"; then
+    log "could not work out what changed"
+    if [ "$dry" = 0 ]; then
+      deploy="" record failed "could not work out what changed (the log)"
+      notify "auto-deploy FAILED" 4 rotating_light "Could not work out what changed: see ~/Library/Logs/tinytrader/auto-deploy.log"
+    fi
+    return 1
+  fi
+  deploy="$(jq -r '.deploy | join(" ")' "$plan_file")"
+  register="$(jq -r '.register | join(" ")' "$plan_file")"
+  if [ -n "$register" ]; then
+    if [ "$dry" = 1 ]; then
+      log "(dry run) would run: scripts/job register ($register)"
+    elif TINYTRADER_SITE="$site" "$stack/scripts/job" register 2>&1; then
+      log "registered the Nomad jobs"
+    else
+      log "scripts/job register failed"
+      notify "auto-deploy: Nomad jobs not registered" 4 rotating_light "scripts/job register failed: see ~/Library/Logs/tinytrader/auto-deploy.log"
+    fi
+  fi
+  manual="$(jq -r '[.manual[] | .item] | join("; ")' "$plan_file")"
+  summary="$(ranges)"
+
+  if [ -z "$deploy" ]; then
+    log "no service to deploy"
+    if [ "$dry" = 1 ]; then
+      [ -z "$manual" ] || log "(dry run) would notify: needs a manual deploy: $manual"
+      return 0
+    fi
+    record nothing
+    [ -z "$manual" ] || notify "auto-deploy: manual deploy needed" 3 point_right "$summary
+Needs a manual deploy: $manual"
+    return 0
+  fi
+
+  if [ "$dry" = 1 ]; then
+    log "(dry run) would run: scripts/deploy $deploy"
+    [ -z "$manual" ] || log "(dry run) would notify: needs a manual deploy: $manual"
+    return 0
+  fi
+
+  log "== scripts/deploy $deploy"
+  out_file="$(mktemp "${TMPDIR:-/tmp}/auto-deploy-out.XXXXXX")"
+  set +e
+  # shellcheck disable=SC2086
+  TINYTRADER_SRC="$src" TINYTRADER_SITE="$site" "$stack/scripts/deploy" $deploy 9>&- 2>&1 | tee "$out_file"
+  status=${PIPESTATUS[0]}
+  set -e
+  extra=""
+  [ -z "$manual" ] || extra="
+Needs a manual deploy: $manual"
+  if [ "$status" = 0 ]; then
+    log "deployed: $deploy"
+    record deployed
+    notify "auto-deploy: deployed $deploy" 3 white_check_mark "$summary$extra"
+  else
+    log "scripts/deploy failed (exit $status)"
+    record failed "scripts/deploy exit $status"
+    notify "auto-deploy FAILED: $deploy" 4 rotating_light "$summary
+scripts/deploy exited $status:
+$(tail -n 15 "$out_file")$extra"
+    return 1
+  fi
+}
+
+# The console's writes in the site that are committed (decision 0009):
+# these files, and nothing else under state/console.
+STATE_FILES=(state/console/reminders.json state/console/layouts.json state/console/journal.json)
+
+# Commit the console's state and push it to main, before anything is
+# fast-forwarded (decision 0012): as you (git config user.name and
+# user.email), "Console state: <what changed>". Where main has moved, the
+# console's commits go on top of it (a rebase, worked out by git merge-tree
+# so the checkout is never left half-merged). Never forced. A conflict with
+# main, a file that isn't valid JSON, or a push git refuses goes in
+# $problems, so the run is skipped and notified; the edits stay in the
+# checkout (committed there) until it is resolved by hand.
+console_state() {
+  local files=() f changed bad msg n c tree new out conflicts
+  # On another branch: repo() reports it, and nothing is committed.
+  [ "$(git -C "$site" symbolic-ref --quiet --short HEAD || true)" = main ] || return 0
+  for f in "${STATE_FILES[@]}"; do
+    if [ -e "$site/$f" ]; then files+=("$f"); fi
+  done
+  [ ${#files[@]} -gt 0 ] || return 0
+
+  changed="$(git -C "$site" status --porcelain --untracked-files=all -- "${files[@]}" | cut -c4-)"
+  if [ -n "$changed" ]; then
+    bad=""
+    while read -r f; do
+      python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$site/$f" 2>/dev/null || bad="$bad $f"
+    done <<<"$changed"
+    if [ -n "$bad" ]; then
+      problems="${problems} console state not committed (not valid JSON:$bad);"
+      return 0
+    fi
+    if [ -z "$(git -C "$site" config user.name || true)" ] || [ -z "$(git -C "$site" config user.email || true)" ]; then
+      problems="${problems} console state not committed (no git user.name or user.email);"
+      return 0
+    fi
+    msg="Console state: $(state_summary HEAD "" "${files[@]}")"
+    if [ "$dry" = 1 ]; then
+      log "(dry run) would commit: $msg"
+    else
+      git -C "$site" add -- "${files[@]}"
+      git -C "$site" commit --quiet --no-verify -m "$msg" -- "${files[@]}"
+      log "committed $(git -C "$site" rev-parse --short HEAD): $msg"
+    fi
+  fi
+
+  if ! git -C "$site" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --quiet origin main </dev/null 2>/dev/null; then
+    log "$project: git fetch failed; console state not pushed this run"
+    return 0
+  fi
+  n="$(git -C "$site" rev-list --count origin/main..HEAD)"
+  [ "$n" -gt 0 ] || return 0
+  if [ "$dry" = 1 ]; then
+    log "(dry run) would push $n console state commit(s) to main"
+    return 0
+  fi
+  # Only the console's own commits are pushed: anything else here is a
+  # person's, and repo() reports it.
+  for c in $(git -C "$site" rev-list origin/main..HEAD); do
+    if [ "$(git -C "$site" rev-list --parents -n 1 "$c" | wc -w | tr -d ' ')" != 2 ] ||
+      git -C "$site" diff-tree --no-commit-id --name-only -r "$c" | grep -qvxF "$(printf '%s\n' "${STATE_FILES[@]}")"; then
+      log "$project: ${c:0:12} is not a console state commit: nothing pushed"
+      return 0
+    fi
+  done
+
+  if git -C "$site" merge-base --is-ancestor origin/main HEAD; then
+    new="$(git -C "$site" rev-parse HEAD)"
+  else
+    # Main has moved: the console's commits on top of it, as one commit.
+    out="$(git -C "$site" merge-tree --write-tree --name-only --no-messages origin/main HEAD 2>&1)" && c=0 || c=$?
+    if [ "$c" = 1 ]; then
+      conflicts="$(sed 1d <<<"$out" | sed '/^$/d' | tr '\n' ' ')"
+      problems="${problems} console state conflicts with origin/main (${conflicts% }): not pushed, the edits are committed in $site (git log origin/main..HEAD), merge them by hand;"
+      return 0
+    elif [ "$c" != 0 ]; then
+      problems="${problems} console state not pushed (git merge-tree: ${out//$'\n'/ });"
+      return 0
+    fi
+    tree="$(head -n1 <<<"$out")"
+    if [ "$n" = 1 ]; then
+      msg="$(git -C "$site" log -1 --format=%B HEAD)"
+    else
+      msg="Console state: $(state_summary "$(git -C "$site" merge-base origin/main HEAD)" HEAD "${STATE_FILES[@]}")"
+    fi
+    new="$(git -C "$site" commit-tree "$tree" -p origin/main -m "$msg")"
+  fi
+  if ! out="$(git -C "$site" push --quiet --no-verify origin "$new:refs/heads/main" 2>&1 </dev/null)"; then
+    problems="${problems} console state not pushed (git push: ${out//$'\n'/ });"
+    return 0
+  fi
+  log "pushed console state to main: ${new:0:12} $(git -C "$site" log -1 --format=%s "$new")"
+  if [ "$new" != "$(git -C "$site" rev-parse HEAD)" ] &&
+    ! out="$(git -C "$site" reset --quiet --keep "$new" 2>&1)"; then
+    # A console edit since the commit, in a file main also changed: the next
+    # run commits it on top and tries again.
+    problems="${problems} console state pushed (${new:0:12}), but the checkout could not move to it (${out//$'\n'/ });"
+  fi
+  return 0
+}
+
+# What changed in the console's state, in a few words, for the commit
+# message: state_summary OLD NEW FILE..., OLD a commit, NEW a commit or ""
+# (the working tree).
+state_summary() {
+  local old="$1" new="$2"
+  shift 2
+  SITE="$site" OLD="$old" NEW="$new" python3 -c "$SUMMARY_PY" "$@"
+}
+
+SUMMARY_PY='
+import json, os, subprocess, sys
+
+e = os.environ
+
+def load(rev, path):
+    if rev:
+        r = subprocess.run(["git", "-C", e["SITE"], "show", "%s:%s" % (rev, path)],
+                           capture_output=True, text=True)
+        text = r.stdout if r.returncode == 0 else None
+    else:
+        try:
+            text = open(os.path.join(e["SITE"], path)).read()
+        except OSError:
+            text = None
+    if text is None:
+        return None, None
+    try:
+        return text, json.loads(text)
+    except ValueError:
+        return text, None
+
+def short(s, n=40):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+def records(old, new, key, label):
+    def by_id(doc):
+        xs = doc.get(key) if isinstance(doc, dict) else None
+        return {str(x.get("id")): x for x in xs or [] if isinstance(x, dict)}
+    a, b = by_id(old), by_id(new)
+    groups = (("added", [b[k] for k in b if k not in a]),
+              ("edited", [b[k] for k in b if k in a and a[k] != b[k]]),
+              ("removed", [a[k] for k in a if k not in b]))
+    long, brief = [], []
+    for word, xs in groups:
+        if not xs:
+            continue
+        brief.append("%d %s" % (len(xs), word))
+        if len(xs) <= 2:
+            long.append("%d %s: %s" % (len(xs), word, ", ".join(short(label(x)) for x in xs)))
+        else:
+            long.append("%d %s" % (len(xs), word))
+    return long, brief
+
+names = {"reminders.json": "reminders", "layouts.json": "layouts", "journal.json": "journal"}
+long_parts, brief_parts = [], []
+for path in sys.argv[1:]:
+    old_text, old = load(e["OLD"], path)
+    new_text, new = load(e["NEW"], path)
+    if old_text == new_text:
+        continue
+    name = names.get(os.path.basename(path), os.path.basename(path))
+    l = b = []
+    if name == "reminders":
+        l1, b1 = records(old, new, "items", lambda x: x.get("title", x.get("id")))
+        l2, b2 = records(old, new, "lists", lambda x: x.get("name", x.get("id")))
+        l = l1 + ["lists " + p for p in l2]
+        b = b1 + ["lists " + p for p in b2]
+    elif name == "journal":
+        l, b = records(old, new, "entries", lambda x: x.get("day", x.get("id")))
+    elif name == "layouts" and isinstance(old, dict) and isinstance(new, dict):
+        keys = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+        l = [", ".join(keys)] if keys else []
+        b = ["%d settings" % len(keys)] if keys else []
+    if not l:
+        l = b = ["rewritten"]
+    long_parts.append("%s (%s)" % (name, "; ".join(l)))
+    brief_parts.append("%s (%s)" % (name, "; ".join(b)))
+text = ", ".join(long_parts)
+if len(text) > 100:
+    text = ", ".join(brief_parts)
+print(text or "no change")
+'
+
+# Report what stops a deploy: logged every time, notified when it changes.
+skip() {
+  if [ "$dry" = 1 ]; then log "(dry run) would skip:${problems}"; return 0; fi
+  if [ "$(state_get skip)" = "$problems" ]; then say "still skipping:${problems}"; return 0; fi
+  log "skipping ($(ranges)):${problems}"
+  notify "auto-deploy skipped" 3 warning "Not deployed:${problems}"
+  record skipped "$problems"
+}
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+# Chatter: only when run by hand (a scheduled run logs only what happens).
+say() { [ "$scheduled" = 1 ] || log "$@"; }
+# A checkout's name, as the state file and the messages give it.
+name() {
+  case "$1" in
+    tt) echo tinytrader ;;
+    stack) echo tinytrader-deploy ;;
+    *) echo "$project" ;;
+  esac
+}
+
+# Deploys may start outside 09:25-16:20 New York time on weekdays (as
+# scripts/deploy, which doesn't know holidays either), but not after 09:00:
+# a build can take that long and must be done before the open.
+window() {
+  local hm dow
+  hm=$(TZ=America/New_York date +%H%M)
+  dow=$(TZ=America/New_York date +%u)
+  why_closed="it's $(TZ=America/New_York date +%H:%M) ET on a weekday (deploys only 16:20-09:00 ET, and weekends)"
+  [ "$dow" -gt 5 ] || [ "$hm" -ge 1620 ] || [ "$hm" -lt 0900 ]
+}
+
+# Fetch a checkout's origin/main and see where it stands. Sets <r>_path,
+# <r>_from (the last deployed commit), <r>_to (what to deploy), <r>_ff (1 if
+# it must fast-forward), and appends to $problems what stops a deploy.
+# TARGET, when given, is the commit to go to instead of origin/main (one on
+# origin/main: the site's pin of this stack).
+#   repo VAR PATH ALLOWED-DIRTY-PREFIX SINCE [TARGET]
+repo() {
+  local r="$1" path="$2" allow="$3" since="$4" target="${5:-}" n head remote branch dirty from ff=0 to what
+  n="$(name "$r")"
+  if ! git -C "$path" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --quiet origin main </dev/null 2>/dev/null; then
+    log "$n: git fetch failed; using the last fetched origin/main"
+  fi
+  head="$(git -C "$path" rev-parse HEAD)"
+  what="origin/main"
+  if [ -n "$target" ]; then
+    what="the site's pin ${target:0:12}"
+    if ! remote="$(git -C "$path" rev-parse --verify --quiet "$target^{commit}")"; then
+      problems="${problems} $n: $what isn't fetched (not on origin/main?);"
+      remote="$head"
+    elif ! git -C "$path" merge-base --is-ancestor "$remote" origin/main; then
+      problems="${problems} $n: $what isn't on origin/main;"
+    fi
+  else
+    remote="$(git -C "$path" rev-parse origin/main)"
+  fi
+  to="$head"
+  if [ "$head" != "$remote" ]; then
+    if git -C "$path" merge-base --is-ancestor "$head" "$remote"; then
+      ff=1 to="$remote"
+    elif git -C "$path" merge-base --is-ancestor "$remote" "$head"; then
+      problems="${problems} $n is ahead of $what;"
+    else
+      problems="${problems} $n has diverged from $what;"
+    fi
+  fi
+  branch="$(git -C "$path" symbolic-ref --quiet --short HEAD || echo "(detached)")"
+  [ "$branch" = main ] || problems="${problems} $n is on $branch, not main;"
+  dirty="$(git -C "$path" status --porcelain --untracked-files=no)"
+  [ -z "$allow" ] || dirty="$(printf '%s\n' "$dirty" | grep -v "^.. $allow" || true)"
+  [ -z "$dirty" ] || problems="${problems} $n has uncommitted changes ($(printf '%s\n' "$dirty" | wc -l | tr -d ' ') files);"
+  if [ -n "$since" ]; then
+    from="$(git -C "$path" rev-parse --verify --quiet "$since^{commit}")" || { echo "$n: no commit $since" >&2; exit 2; }
+  else
+    from="$(state_get "deployed.$n")"
+    [ -n "$from" ] || from="$head"   # first run: what is checked out counts as deployed
+  fi
+  eval "${r}_path=\$path ${r}_from=\$from ${r}_to=\$to ${r}_ff=\$ff"
+}
+
+range() {
+  local from to path
+  eval "from=\$${1}_from to=\$${1}_to path=\$${1}_path"
+  if [ "$from" = "$to" ]; then echo "${to:0:12} (unchanged)"
+  else echo "${from:0:12}..${to:0:12} ($(git -C "$path" rev-list --count "$from..$to" 2>/dev/null || echo "?") commits)"; fi
+}
+
+# A field of the state file ("deployed.tinytrader", "failed", "skip").
+state_get() {
+  python3 -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1]))
+    for k in sys.argv[2].split("."):
+        v = v.get(k) if isinstance(v, dict) else None
+except (OSError, ValueError):
+    v = None
+if isinstance(v, dict):
+    v = "%s %s %s" % (v.get("tinytrader", ""), v.get("tinytrader-deploy", ""), v.get(sys.argv[3], ""))
+print(v or "")' "$state_file" "$1" "$project"
+}
+
+# Each checkout's range, for the log and the notices.
+ranges() {
+  echo "tinytrader $(range tt), tinytrader-deploy $(range stack), $project $(range site)"
+}
+
+# Record a run: RESULT (baseline|deployed|failed|nothing|skipped) [DETAIL],
+# with the plan's manual items.
+record() {
+  RESULT="$1" DETAIL="${2:-}" PLAN="${plan_file:-}" STATE="$state_file" DEPLOY="${deploy:-}" \
+    PROJECT="$project" TT_FROM="$tt_from" TT_TO="$tt_to" STACK_FROM="$stack_from" STACK_TO="$stack_to" \
+    SITE_FROM="$site_from" SITE_TO="$site_to" python3 -c '
+import datetime, json, os
+e = os.environ
+path = e["STATE"]
+try:
+    s = json.load(open(path))
+except (OSError, ValueError):
+    s = {}
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+to = {"tinytrader": e["TT_TO"], "tinytrader-deploy": e["STACK_TO"], e["PROJECT"]: e["SITE_TO"]}
+result = e["RESULT"]
+try:
+    manual = json.load(open(e["PLAN"]))["manual"]
+except (OSError, ValueError, KeyError):
+    manual = []
+if result == "baseline":
+    if "deployed" in s:
+        raise SystemExit(0)
+    s["deployed"] = dict(to, at=now)
+else:
+    entry = {
+        "at": now,
+        "result": result,
+        "tinytrader": {"from": e["TT_FROM"], "to": e["TT_TO"]},
+        "tinytrader-deploy": {"from": e["STACK_FROM"], "to": e["STACK_TO"]},
+        e["PROJECT"]: {"from": e["SITE_FROM"], "to": e["SITE_TO"]},
+        "services": e["DEPLOY"].split() if result in ("deployed", "failed") else [],
+        "manual": manual,
+        "detail": e["DETAIL"],
+    }
+    s["last"] = entry
+    s["history"] = (s.get("history") or [])[-99:] + [entry]
+    if result == "skipped":
+        s["skip"] = e["DETAIL"]
+    else:
+        s.pop("skip", None)
+    if result == "failed":
+        s["failed"] = to
+    else:
+        s.pop("failed", None)
+    if result in ("deployed", "nothing"):
+        s["deployed"] = dict(to, at=now)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(s, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)'
+}
+
+# Push a notice (TITLE PRIORITY TAGS BODY) to notify.env's ntfy topic; the
+# URL reaches curl on its stdin, not its command line. A dry run prints it.
+notify() {
+  local url
+  if [ "$dry" = 1 ]; then log "(dry run) would notify: $1: ${4//$'\n'/ | }"; return 0; fi
+  url="$(sops decrypt --input-type dotenv --output-type dotenv "$site/secrets/notify.env" 2>/dev/null | sed -n 's/^NTFY_URL=//p' | head -n1 || true)"
+  if [ -z "$url" ]; then log "no NTFY_URL (secrets/notify.env): not sent: $1"; return 0; fi
+  printf 'url = "%s"\n' "$url" | curl -fsS -m 15 --retry 2 -o /dev/null -K - \
+    -H "Title: $1" -H "Priority: $2" -H "Tags: $3" --data-binary "$4" 2>/dev/null ||
+    log "could not deliver the notice: $1"
+}
+
+# The plan: which compose services the commits between *_FROM and *_TO
+# change, from the paths they touch. Writes {deploy, manual, why} to $PLAN
+# and logs the reasons. When unsure, every eligible service.
+PLAN_PY='
+import fnmatch, json, os, re, subprocess, sys, tempfile
+
+e = os.environ
+site, stack, src, project = e["SITE"], e["STACK"], e["SRC"], e["PROJECT"]
+eligible = set(e["ELIGIBLE"].split())
+never = e["NEVER"].split()
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", repo] + list(args), check=True,
+                          capture_output=True, text=True).stdout
+
+def show(repo, rev, path):
+    r = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (rev, path)],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+def changed(repo, a, b):
+    if a == b:
+        return []
+    ok = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", a, b]).returncode == 0
+    if not ok:
+        return None  # not a fast-forward of what was deployed: unsure
+    return [p for p in git(repo, "diff", "--name-only", a, b).splitlines() if p]
+
+def compose(rev):
+    text = show(site, rev, "deploy/local/compose.yaml")
+    if text is None:
+        return None
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "compose.yaml")
+        open(f, "w").write(text)
+        r = subprocess.run(["docker", "compose", "-f", f, "config", "--no-interpolate",
+                            "--no-path-resolution", "--format", "json"],
+                           capture_output=True, text=True)
+    return json.loads(r.stdout) if r.returncode == 0 else None
+
+new = compose(e["SITE_TO"])
+if new is None:
+    sys.exit("auto-deploy: could not read the site deploy/local/compose.yaml at " + e["SITE_TO"])
+services = new["services"]
+# What runs here by default: placed here, and in no compose profile (the idle relays).
+here = sorted(s for s in services if s in eligible and not services[s].get("profiles"))
+ALL = "*"
+why = {}  # service (or ALL) -> reasons
+register = []  # Nomad job specs or what they embed changed: scripts/job register
+
+def hit(target, reason):
+    why.setdefault(target, [])
+    if reason not in why[target]:
+        why[target].append(reason)
+
+manual = []
+def hand(item, reason):
+    for m in manual:
+        if m["item"] == item:
+            if reason not in m["why"]:
+                m["why"] += ", " + reason
+            return
+    manual.append({"item": item, "why": reason})
+
+# tinytrader: services/<image>/ is that image; libs/<lib>/ every image whose
+# crate depends on it (transitively, from the Cargo.toml files); the workspace
+# and the Nix build every image.
+def crates(rev):
+    deps, dirs = {}, {}
+    for top in ("libs", "services"):
+        for d in git(src, "ls-tree", "--name-only", "%s:%s" % (rev, top)).split():
+            text = show(src, rev, "%s/%s/Cargo.toml" % (top, d))
+            if text is None:
+                continue
+            m = re.search(r"^name\s*=\s*\"([^\"]+)\"", text, re.M)
+            if not m:
+                continue
+            name = m.group(1)
+            dirs["%s/%s" % (top, d)] = name
+            deps[name] = set(re.findall(r"^(tinytrader(?:-[a-z0-9-]+)?)\s*[=.]", text, re.M)) | \
+                set(re.findall(r"^\[(?:dev-|build-)?dependencies\.(tinytrader(?:-[a-z0-9-]+)?)\]", text, re.M))
+    return deps, dirs
+
+def image_users(image):
+    return [s for s in services if services[s].get("image") == "tinytrader/%s:nix" % image]
+
+tt = changed(src, e["TT_FROM"], e["TT_TO"])
+if tt is None:
+    hit(ALL, "tinytrader: %s is not an ancestor of %s" % (e["TT_FROM"][:12], e["TT_TO"][:12]))
+    tt = []
+if tt:
+    deps, dirs = crates(e["TT_TO"])
+    def closure(name, seen=None):
+        seen = seen if seen is not None else set()
+        for d in deps.get(name, ()):
+            if d not in seen:
+                seen.add(d)
+                closure(d, seen)
+        return seen
+    images = sorted({services[s]["image"][len("tinytrader/"):-len(":nix")] for s in services
+                     if services[s].get("image", "").startswith("tinytrader/")})
+    whole = {"Cargo.lock", "Cargo.toml", "rust-toolchain.toml", "flake.nix", "flake.lock",
+             "nix/rust.nix", "nix/images.nix", "nix/build-images.sh"}
+    nothing = ("docs/", ".github/", "examples/", "apps/", "infra/", "nix/watch", "nix/generic.nix",
+               "nix/web.nix", "LICENSE", "Dockerfile", "docker-bake.hcl", ".dockerignore", ".gitignore",
+               ".envrc", ".editorconfig", ".gitattributes", "TODO.org")
+    for p in tt:
+        reason = "tinytrader " + p
+        parts = p.split("/")
+        if p in whole:
+            hit(ALL, reason)
+        elif p.startswith(nothing) or p.endswith(".md"):
+            continue
+        elif parts[0] == "services" and len(parts) > 2:
+            for s in image_users(parts[1]):
+                hit(s, reason)
+        elif parts[0] == "libs" and len(parts) > 2:
+            lib = dirs.get("libs/" + parts[1])
+            if lib is None:
+                hit(ALL, reason)
+                continue
+            for img in images:
+                crate = dirs.get("services/" + img)
+                if crate is None or lib in closure(crate):
+                    for s in image_users(img):
+                        hit(s, reason)
+        elif parts[0] in ("libs", "services"):
+            continue  # their READMEs
+        else:
+            hit(ALL, reason)
+
+# The site: compose.yaml service by service; the inventory and the secrets
+# reach every container; its flake (the inputs of the role modules) is native (the
+# machines repository).
+native = "native services (in your machines repository: update the site input, then switch)"
+tailnet = "tailnet forwarding (scripts/tailnet-serve --apply, scripts/tailscale-policy)"
+# Services built from a Dockerfile (the research image), not a tinytrader image.
+built = [s for s in services if services[s].get("build")]
+o = changed(site, e["SITE_FROM"], e["SITE_TO"])
+if o is None:
+    hit(ALL, "%s: %s is not an ancestor of %s" % (project, e["SITE_FROM"][:12], e["SITE_TO"][:12]))
+    o = []
+nothing = ("docs/", "scripts/", "research/", "state/", "design/", "checks/", ".github/",
+           "deploy/local/topology.json", "secrets/README.md", "secrets/runner.env",
+           "secrets/tailscale.env", "secrets/nomad.env", "secrets/tailnet-lock.yaml", "README.md",
+           "AGENTS.md", "CONTRIBUTING.md", ".gitignore", ".sops.yaml")
+for p in o:
+    reason = project + " " + p
+    parts = p.split("/")
+    if p == "deploy/local/compose.yaml":
+        old = compose(e["SITE_FROM"])
+        if old is None:
+            hit(ALL, reason)
+            continue
+        for k in set(old) | set(new):
+            if k != "services" and old.get(k) != new.get(k):
+                hit(ALL, "%s (%s)" % (reason, k))
+        for s in services:
+            if old["services"].get(s) != services[s]:
+                hit(s, reason)
+    elif p == "deploy/local/queue-templates.yaml":
+        hit("queue", reason)
+    elif p.startswith("deploy/nomad/"):
+        # The batch scheduler jobs and access policy: registered again, no
+        # container touched (its policy, deployment.nomad, is the inventory).
+        register.append(project + " " + p)
+    elif p in ("pyproject.toml", "uv.lock", ".python-version"):
+        # The lock the research image installs.
+        for s in built:
+            hit(s, reason)
+    elif p == "inventory.nix":
+        hit(ALL, reason)
+        hand(tailnet, p)
+        hand(native, p)
+    elif p.startswith("hosts/") or p in ("flake.nix", "flake.lock"):
+        hand(native, p)
+    elif p.startswith("tailscale/"):
+        hand(tailnet, p)
+    elif parts[0] == "strategies" and len(parts) > 2 and parts[1] in services:
+        hit(parts[1], reason)
+    elif p.startswith(nothing) or p.startswith("strategies/") or p.endswith((".example", ".md", ".org")):
+        continue  # notes (a top-level notes file once redeployed every container)
+    elif p.startswith("secrets/"):
+        hit(ALL, reason)
+    else:
+        hit(ALL, reason)
+
+# This stack: the addresses reach every container; the console topology
+# the console; the research image what is built from it; the modules and the
+# flake are native, once the site flake.lock takes them.
+t = changed(stack, e["STACK_FROM"], e["STACK_TO"])
+if t is None:
+    hit(ALL, "tinytrader-deploy: %s is not an ancestor of %s" % (e["STACK_FROM"][:12], e["STACK_TO"][:12]))
+    t = []
+stack_nothing = ("docs/", "scripts/", "checks/", "example/", ".github/", "README.md", "AGENTS.md",
+                 "CONTRIBUTING.md", "LICENSE", ".gitignore")
+for p in t:
+    reason = "tinytrader-deploy " + p
+    if p == "deploy/local/endpoints.nix":
+        hit(ALL, reason)
+        hand(tailnet, p)
+        hand(native, "tinytrader-deploy " + p)
+    elif p == "deploy/local/topology.nix":
+        hit("console", reason)
+    elif p.startswith("deploy/local/research/"):
+        for s in built:
+            hit(s, reason)
+    elif p == "deploy/nomad/gate.sh" or p.startswith("deploy/nomad/acl/"):
+        # Embedded in every job (the gate), or the default access policy.
+        register.append("tinytrader-deploy " + p)
+    elif p.startswith("deploy/nomad/"):
+        hand(native, "tinytrader-deploy " + p + " (once the site flake.lock takes it)")
+    elif p.startswith(("modules/", "roles/", "lib/")) or p in ("flake.nix", "flake.lock"):
+        hand(native, "tinytrader-deploy " + p + " (once the site flake.lock takes it)")
+    elif p.startswith("tailscale/"):
+        hand(tailnet, "tinytrader-deploy " + p)
+    elif p.startswith(stack_nothing) or p.endswith(".md"):
+        continue
+    else:
+        hit(ALL, reason)
+
+targets = set()
+for t in why:
+    targets |= set(here) if t == ALL else {t}
+def excluded(s):
+    return any(fnmatch.fnmatchcase(s, pat) for pat in never)
+deploy = sorted(s for s in targets if s in here and not excluded(s))
+for s in sorted(targets):
+    if s in here and excluded(s):
+        hand(s, "; ".join((why.get(s, []) + why.get(ALL, []))[:3]))
+for s in deploy:
+    print("  %-22s %s" % (s, "; ".join((why.get(s, []) + why.get(ALL, []))[:4])))
+for m in manual:
+    print("  manual: %s: %s" % (m["item"], m["why"]))
+skipped = sorted(s for s in targets if s != ALL and s not in here)
+if skipped:
+    print("  not here, or off by default (a compose profile): " + " ".join(skipped))
+if register:
+    print("  nomad jobs: scripts/job register (%s)" % ", ".join(register[:4]))
+json.dump({"deploy": deploy, "manual": manual, "why": why, "register": register}, open(e["PLAN"], "w"))
+'
+
+main "$@"
+exit $?

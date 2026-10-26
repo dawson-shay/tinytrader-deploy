@@ -1,0 +1,36 @@
+# The job queue's templates (tinytrader decision 0012): the only work the
+# queue runs. A job names a template and gives its parameters, each checked
+# against its pattern and placed only in the command's {slots}. ${VAR} is
+# filled from the queue's environment (compose.yaml sets TINYTRADER_SITE,
+# and TT_URL_CONSOLE: the console's address on the queue's host).
+#
+# Docker templates run as one-off containers on the Compose network. Host
+# templates run on the Mac through `queue host-runner`, under taskpolicy -b.
+
+# A research collector (research/collect_*.py), in the research image.
+apiVersion: tinytrader/v1
+kind: JobTemplate
+metadata:
+  name: research-collector
+  description: Run a research collector in the research image.
+spec:
+  runner: docker
+  class: background
+  parameters:
+    script:
+      pattern: '^collect_[a-z0-9_]+\.py$'
+      description: A collector in research/, e.g. collect_quotes.py
+  activeDeadlineSeconds: 14400
+  template:
+    spec:
+      containers:
+        - image: my-site/research:local
+          command: [python, '{script}']
+          workingDir: /work
+          env:
+            - { name: TT_CONSOLE, value: '${TT_URL_CONSOLE}' }
+          resources: { limits: { cpu: '1', memory: 1Gi } }
+          volumeMounts:
+            - { name: research, mountPath: /work }
+      volumes:
+        - { name: research, hostPath: { path: '${TINYTRADER_SITE}/research' } }

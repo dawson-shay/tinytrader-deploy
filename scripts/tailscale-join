@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Put a machine on the tailnet: `tailscale up` on it, over SSH from the Mac
+# you work at. Run it after the machine's first switch (which starts
+# tailscaled), then scripts/tailscale-pin to give it back its old name and
+# address.
+#
+#   scripts/tailscale-join TARGET                 untagged, as you: tailscale up prints a
+#                                                 login URL; open it on any device and sign in
+#   scripts/tailscale-join TARGET --key-stdin     untagged, unattended: with an auth key you
+#                                                 made in the admin console (Settings > Keys),
+#                                                 on standard input, e.g. pbpaste | ...
+#   scripts/tailscale-join TARGET --tags TAGS     tagged, unattended: mints a one-time,
+#                                                 pre-approved key for TAGS (comma-separated,
+#                                                 e.g. tag:tinytrader) with the OAuth client
+#
+# TARGET is an ssh destination (before Tailscale, its LAN address). Add
+# --hostname NAME to set the name it registers with.
+#
+# Why a machine you sit at joins interactively (or with a key from the admin console): a
+# device's owner is whoever's key it joins with. Keys the OAuth client mints,
+# and its secret used as a key, must carry tags (Tailscale: "All auth keys
+# created from an OAuth client must use tags"), and such a device is owned by
+# the tailnet, not by you. Machines you own stay your untagged devices; only a key you make yourself (the admin console, or the API with
+# your own API access token) joins one untagged. --tags is for the hosts that
+# carry them (servers owned by the tailnet), and needs the client's auth_keys
+# scope with those tags.
+#
+# An auth key never reaches a command line or the terminal: it goes to a
+# private temporary file on TARGET (mode 600) that tailscale reads
+# (--auth-key=file:...) and that is deleted after, whatever happens. Minted
+# keys are single-use and expire in 10 minutes.
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+export PATH="/run/current-system/sw/bin:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"
+
+# With Tailnet Lock on, a new device is locked out until a signing machine
+# signs it: this one, if it's one (scripts/tailnet-lock).
+lock_sign() {
+  [ "$(tailscale lock status --json 2>/dev/null | jq -r .Enabled 2>/dev/null)" = true ] || return 0
+  "$stack/scripts/tailnet-lock" sign "$target" || echo "sign it from a signing machine: scripts/tailnet-lock sign $target" >&2
+}
+
+usage() { sed -n '/^#   scripts/,/^# TARGET/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
+target="" tags="" key_stdin=no name=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tags) [ $# -ge 2 ] || usage; tags="$2"; shift ;;
+    --key-stdin) key_stdin=yes ;;
+    --hostname) [ $# -ge 2 ] || usage; name="$2"; shift ;;
+    -*) usage ;;
+    *) [ -z "$target" ] || usage; target="$1" ;;
+  esac
+  shift
+done
+[ -n "$target" ] || usage
+[ -z "$tags" ] || [ "$key_stdin" = no ] || { echo "--tags or --key-stdin, not both" >&2; exit 2; }
+if [ -n "$tags" ]; then
+  [[ "$tags" =~ ^tag:[a-z0-9-]+(,tag:[a-z0-9-]+)*$ ]] || { echo "TAGS: tag:a,tag:b ($tags)" >&2; exit 2; }
+fi
+[ -z "$name" ] || [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "--hostname: a name's first label ($name)" >&2; exit 2; }
+
+up=(tailscale up)
+[ -z "$name" ] || up+=("--hostname=$name")
+[ -z "$tags" ] || up+=("--advertise-tags=$tags")
+# nix-darwin's (or NixOS's) system profile, or the Tailscale app's CLI on a Mac.
+remote_path='PATH=/run/current-system/sw/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH'
+
+if [ -z "$tags" ] && [ "$key_stdin" = no ]; then
+  echo "On $target: sudo ${up[*]} (it prints a URL to sign in at)"
+  ssh -t "$target" "$remote_path sudo ${up[*]}"
+  lock_sign
+  exit 0
+fi
+
+# An auth key, into a private file on TARGET.
+tmp="$(ssh "$target" 'umask 077 && mktemp -d')"
+[ -n "$tmp" ] || { echo "could not make a temporary folder on $target" >&2; exit 1; }
+trap 'ssh "$target" "rm -rf $(printf %q "$tmp")" 2>/dev/null || true' EXIT
+if [ "$key_stdin" = yes ]; then
+  [ ! -t 0 ] || echo "Paste the auth key (tskey-auth-...), then Return and Ctrl-D:" >&2
+  key="$(tr -d '[:space:]')"
+  case "$key" in tskey-auth-*) ;; *) echo "that isn't an auth key (tskey-auth-...)" >&2; exit 1 ;; esac
+  printf '%s' "$key" | ssh "$target" "cat > $(printf %q "$tmp")/key"
+  unset key
+else
+  for c in sops jq curl; do command -v "$c" >/dev/null || { echo "$c not found" >&2; exit 1; }; done
+  # shellcheck source=lib/tailscale-api.sh
+  . "$stack/scripts/lib/tailscale-api.sh"
+  ts_login
+  body="$(jq -nc --arg tags "$tags" --arg d "tailscale-join ${name:-$target}" '{
+    capabilities: {devices: {create: {reusable: false, ephemeral: false, preauthorized: true, tags: ($tags | split(","))}}},
+    expirySeconds: 600,
+    description: ($d | gsub("[^A-Za-z0-9 -]"; "-") | .[0:50])
+  }')"
+  ts_api POST tailnet/-/keys "$body" | jq -j '.key // empty' | ssh "$target" "cat > $(printf %q "$tmp")/key"
+  ssh "$target" "test -s $(printf %q "$tmp")/key" || { echo "no key was minted (the client's auth_keys scope, and its tags?)" >&2; exit 1; }
+  echo "minted a one-time key for $tags (expires in 10 minutes)"
+fi
+echo "On $target: sudo ${up[*]} --auth-key=file:<the key>"
+ssh -t "$target" "$remote_path sudo ${up[*]} --auth-key=file:$(printf %q "$tmp")/key; s=\$?; rm -f $(printf %q "$tmp")/key; exit \$s"
+ssh "$target" "$remote_path tailscale ip -4" | sed 's/^/its address: /'
+lock_sign

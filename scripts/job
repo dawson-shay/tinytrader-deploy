@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# The batch scheduler (Nomad; docs/batch-jobs.md), for people and agents on
+# any machine with the operator key:
+#   scripts/job run JOB KEY=VALUE... [--when WHEN] [--not-before TIME]
+#                              dispatch one (the site's deploy/nomad/jobs/JOB.nomad.hcl), e.g.
+#                              scripts/job run research-collector script=collect_x.py
+#                              WHEN: anytime, after-close, background-may-run (the
+#                              job's default otherwise); TIME: anything `date -d` reads
+#   scripts/job list [JOB]     runs, newest first
+#   scripts/job status RUN     one run (the ID run printed)
+#   scripts/job logs RUN [TASK] [-f] [--stderr]
+#                              its output (TASK: the work, by default; or gate)
+#   scripts/job cancel RUN     stop it
+#   scripts/job pool [on|off NODE]
+#                              the nodes and whether they take work; off: no new
+#                              work there (running work finishes), e.g. the laptop
+#                              on battery; on: back in the pool
+#   scripts/job register [--check]
+#                              submit every job in the site's deploy/nomad/jobs/ (auto-deploy
+#                              does it when they change); --check: validate only
+#   scripts/job ui             the UI's address
+# The server is the site's inventory.nix deployment.nomad.server; NOMAD_ADDR
+# overrides it. Changes use the management token in the site's
+# secrets/nomad.env (scripts/nomad-bootstrap), or NOMAD_TOKEN; reads need
+# none. The site is scripts/lib/site.sh's.
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+export PATH="/run/current-system/sw/bin:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"
+usage() { sed -n '/^#   scripts\/job run/,/^# The server/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
+command -v nomad >/dev/null || { echo "nomad not found (it comes with modules/nomad-darwin.nix's switch)" >&2; exit 1; }
+jobs_dir="$site/deploy/nomad/jobs"
+token_file="$site/secrets/nomad.env"
+
+# This host's agent if it has one, else the server's forward on the tailnet.
+if [ -z "${NOMAD_ADDR:-}" ]; then
+  if curl -fsS -m 2 http://127.0.0.1:4646/v1/agent/health >/dev/null 2>&1; then
+    NOMAD_ADDR=http://127.0.0.1:4646
+  else
+    NOMAD_ADDR="http://$(nix eval --raw --impure --expr "
+      let i = import $site/inventory.nix; c = i.deployment.nomad;
+      in \"\${i.hosts.\${c.server}.tailnetName}.\${i.tailnet.domain}:\${toString i.services.nomad.ports.http}\"")"
+  fi
+fi
+export NOMAD_ADDR
+
+# nomad with the management token (writes), from secrets/nomad.env.
+as_operator() {
+  if [ -n "${NOMAD_TOKEN:-}" ]; then
+    nomad "$@"
+  elif [ -f "$token_file" ]; then
+    command -v sops >/dev/null || { echo "sops not found" >&2; exit 1; }
+    sops exec-env "$token_file" "$(printf '%q ' nomad "$@")"
+  else
+    echo "no token: secrets/nomad.env is made by scripts/nomad-bootstrap (or set NOMAD_TOKEN)" >&2
+    exit 1
+  fi
+}
+
+# A node's ID from its name.
+node_id() {
+  nomad node status -json | jq -er --arg n "$1" '[.[] | select(.Name == $n or (.Name | split(".")[0]) == $n)][0].ID' ||
+    { echo "no node named $1 (scripts/job pool lists them)" >&2; exit 1; }
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  run)
+    [ $# -ge 1 ] || usage
+    job="$1"; shift
+    [ -f "$jobs_dir/$job.nomad.hcl" ] || { echo "no job $job ($jobs_dir)" >&2; exit 1; }
+    meta=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --when) [ $# -ge 2 ] || usage; meta+=(-meta "when=$2"); shift ;;
+        --not-before)
+          [ $# -ge 2 ] || usage
+          t="$(date -d "$2" +%s 2>/dev/null || date -j -f '%Y-%m-%d %H:%M' "$2" +%s 2>/dev/null)" ||
+            { echo "--not-before: can't read '$2' (e.g. '2026-10-26 18:00')" >&2; exit 2; }
+          meta+=(-meta "not_before=$t"); shift ;;
+        *=*) meta+=(-meta "$1") ;;
+        *) usage ;;
+      esac
+      shift
+    done
+    as_operator job dispatch -detach ${meta[@]+"${meta[@]}"} "$job"
+    ;;
+  list)
+    # A job's own status lists its runs (dispatched children).
+    if [ $# -ge 1 ]; then nomad job status "$1"; else nomad job status; fi
+    ;;
+  status) [ $# -eq 1 ] || usage; nomad job status "$1" ;;
+  logs)
+    [ $# -ge 1 ] || usage
+    run="$1"; shift
+    task="" flags=()
+    for a in "$@"; do
+      case "$a" in -f | --stderr) flags+=("${a/--stderr/-stderr}") ;; -*) usage ;; *) task="$a" ;; esac
+    done
+    alloc="$(nomad job allocs -json "$run" | jq -er 'sort_by(.CreateTime) | last | .ID')" ||
+      { echo "$run has no allocation yet (scripts/job status $run)" >&2; exit 1; }
+    if [ -z "$task" ]; then
+      task="$(nomad alloc status -json "$alloc" | jq -r '.TaskStates | keys - ["gate"] | first')"
+    fi
+    nomad alloc logs ${flags[@]+"${flags[@]}"} "$alloc" "$task"
+    ;;
+  cancel) [ $# -eq 1 ] || usage; as_operator job stop "$1" ;;
+  pool)
+    if [ $# -eq 0 ]; then
+      nomad node status -verbose
+    else
+      [ $# -eq 2 ] || usage
+      case "$1" in
+        on) as_operator node eligibility -enable "$(node_id "$2")" ;;
+        off) as_operator node eligibility -disable "$(node_id "$2")" ;;
+        *) usage ;;
+      esac
+    fi
+    ;;
+  register)
+    # From this stack's root: the jobs read its deploy/nomad/gate.sh by that path.
+    cd "$stack"
+    for f in "$jobs_dir"/*.nomad.hcl; do
+      [ -e "$f" ] || { echo "no jobs in $jobs_dir"; break; }
+      if [ "${1:-}" = --check ]; then
+        # Parsed here, without a server.
+        nomad job run -output "$f" >/dev/null && echo "valid: $f"
+      else
+        as_operator job run -detach "$f" >/dev/null && echo "registered: $(basename "$f" .nomad.hcl)"
+      fi
+    done
+    ;;
+  ui) echo "$NOMAD_ADDR/ui/" ;;
+  *) usage ;;
+esac

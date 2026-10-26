@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Copy the console's order token (the site's secrets/console.env) to this Mac's
+# clipboard, for pasting into the console's prompt or a password manager.
+# Universal Clipboard carries it to your other Apple devices. Prints only
+# its length, never the token.
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+export PATH="/run/current-system/sw/bin:$HOME/.nix-profile/bin:$PATH"
+sops decrypt --extract '["CONSOLE_ORDER_TOKEN"]' "$site/secrets/console.env" | tr -d '\n' | pbcopy
+echo "copied the order token ($(pbpaste | wc -c | tr -d ' ') characters) to the clipboard"

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Promote the console's current views, watchlists and theme into the site's
+# state/console/layouts.json, the curated views kept in git
+# (state/console/README.md), then show the change to
+# review and commit. Nothing is committed here.
+#   scripts/console-promote                  views, watchlists, theme, from the running console
+#   scripts/console-promote KEY...           these settings instead (e.g. tinytrader-theme)
+#   scripts/console-promote --from PREFS     from a copy of the console's prefs.json (an import)
+#   scripts/console-promote --reset          the console takes layouts.json as committed
+#                                            (after a pull or a hand edit); reload open tabs
+#   CONSOLE_URL     the console (default http://127.0.0.1:8080)
+#   TINYTRADER_SRC  path to a tinytrader checkout (default: ../tinytrader beside this repo)
+#   TINYTRADER_SITE the site (scripts/lib/site.sh)
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+src="${TINYTRADER_SRC:-$stack/../tinytrader}"
+promote="$src/services/console/scripts/prefs-promote"
+test -x "$promote" || { echo "tinytrader's prefs-promote not found at $promote (set TINYTRADER_SRC)" >&2; exit 1; }
+file="$site/state/console/layouts.json"
+
+case "${1:-}" in
+  --reset) exec "$promote" --reset "$file" ;;
+  --from)
+    [ $# -ge 2 ] || { echo "usage: scripts/console-promote --from PREFS [KEY...]" >&2; exit 2; }
+    from="$2"; shift 2
+    "$promote" --from "$from" "$file" "$@" ;;
+  -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) "$promote" "$file" "$@" ;;
+esac
+git -C "$site" diff --stat -- state/console/layouts.json

@@ -1,0 +1,31 @@
+# Written by scripts/secrets-recipients from inventory.nix (docs/decisions/0004).
+# Edit inventory.nix, not this file.
+creation_rules:
+  - path_regex: ^secrets/accounts/[^/]*\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key
+  - path_regex: ^secrets/console\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key
+  # hostOnly (docs/decisions/0013): its hosts and the recovery key, never the operator key.
+  - path_regex: ^secrets/databento\.yaml$
+    age: >-
+      age1-your-offline-recovery-public-key,age1-desk-ssh-host-key
+  - path_regex: ^secrets/gateway\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key
+  - path_regex: ^secrets/notify\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key
+  - path_regex: ^secrets/research\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key
+  - path_regex: ^secrets/runner\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key
+  - path_regex: ^secrets/store\.env$
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key,age1-desk-ssh-host-key
+  - path_regex: ^secrets/
+    age: >-
+      age1-your-operator-public-key,age1-your-offline-recovery-public-key

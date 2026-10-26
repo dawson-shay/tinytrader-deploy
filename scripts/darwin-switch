@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Apply this Mac's nix-darwin configuration from the site's flake: its
+# darwinConfigurations entry named for this Mac's LocalHostName, for a Mac
+# whose whole machine configuration the site carries (most Macs take their
+# role from a machines repository instead; docs/site.md). Asks for your
+# password (activation runs as root). The site is scripts/lib/site.sh's.
+#
+# It builds tinytrader at the revision the site's flake.lock pins, so what
+# runs is what's committed. To try a local checkout instead (development):
+#   TINYTRADER_SRC=../tinytrader scripts/darwin-switch
+set -euo pipefail
+# Nix's tools, whatever shell this runs from (a `!` shell has no login PATH).
+export PATH="/nix/var/nix/profiles/default/bin:$HOME/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+host="$(scutil --get LocalHostName)"
+override=()
+if [ -n "${TINYTRADER_SRC:-}" ]; then
+  override=(--override-input tinytrader "git+file://$(cd "$TINYTRADER_SRC" && pwd)")
+fi
+
+# Agents installed by hand before nix-darwin used the same labels: remove them.
+# Once nix-darwin manages a label, the file there is its own: leave it.
+for label in com.tinytrader.store com.tinytrader.logrotate; do
+  old="$HOME/Library/LaunchAgents/$label.plist"
+  if [ -e "/run/current-system/user/Library/LaunchAgents/$label.plist" ]; then continue; fi
+  if [ -e "$old" ]; then
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    rm "$old"
+    echo "removed the hand-installed $label"
+  fi
+done
+
+# A Mac whose machine config is a machines repository's has no entry in the
+# site: its role comes from the site through that repository's flake.lock.
+has="$(nix eval "$site#darwinConfigurations" --apply "c: c ? \"$host\"")" || {
+  echo "darwin-switch: couldn't evaluate $site's darwinConfigurations (the error is above)." >&2
+  exit 1
+}
+if [ "$has" != true ]; then
+  echo "darwin-switch: no darwinConfigurations.$host in $site: this Mac's machine config is in your machines repository." >&2
+  echo "  There: nix flake update <the site's input>, commit, then switch it." >&2
+  exit 1
+fi
+
+if command -v darwin-rebuild >/dev/null; then
+  rebuild=(darwin-rebuild)
+else
+  # First time: nix-darwin isn't installed yet.
+  rebuild=(nix run "github:nix-darwin/nix-darwin/nix-darwin-26.05#darwin-rebuild" --)
+fi
+sudo "${rebuild[@]}" switch --flake "$site#$host" ${override[@]+"${override[@]}"}

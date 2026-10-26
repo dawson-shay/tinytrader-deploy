@@ -1,0 +1,80 @@
+// The tailnet policy for tinytrader (docs/decisions/0008).
+//
+// GENERATED from inventory.nix by tailscale/policy.nix: edit that, then run
+// scripts/tailscale-policy. `nix flake check` fails while this file differs.
+// Nothing applies it automatically: paste it into the admin console's
+// Access controls, or later apply it with the tailscale/gitops-acl-action.
+//
+// tag:tinytrader goes on the hosts that run services:
+//   desk (desk)
+//   nas (nas, once it exists)
+//   vault (vault)
+// (the admin console's Machines page: the host's menu, Edit ACL tags).
+// Other devices stay yours, untagged.
+{
+  "tagOwners": {
+    "tag:tinytrader": ["autogroup:admin"],
+  },
+
+  "grants": [
+    // Your own devices reach each other, as they did before any policy.
+    {
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:self"],
+      "ip":  ["*"],
+    },
+    // The services' hosts reach each other's service ports, and nothing
+    // else. A port is open only where `tailscale serve` forwards it
+    // (scripts/tailnet-serve): services listen on loopback, and each host
+    // forwards every port of its services (decision 0010). The order
+    // gateways (7701), the Docker proxies and
+    // the console's raw port are never listed: they are reached on their
+    // own host only.
+    // 443: the console's HTTPS (`tailscale serve`), for research's reads.
+    // A tagged host sends no Tailscale login, so the console refuses its writes.
+    {
+      "src": ["tag:tinytrader"],
+      "dst": ["tag:tinytrader"],
+      "ip":  ["tcp:4646", "tcp:4647", "tcp:7600", "tcp:7610", "tcp:8888", "tcp:9100", "tcp:9107", "tcp:9110", "tcp:9114", "tcp:9120", "tcp:9121", "tcp:9123", "tcp:9124", "tcp:9125", "tcp:443"],
+    },
+    // SSH between your devices and the services' hosts, either way.
+    {
+      "src": ["autogroup:member", "tag:tinytrader"],
+      "dst": ["autogroup:member", "tag:tinytrader"],
+      "ip":  ["tcp:22"],
+    },
+    // The console from your devices: `tailscale serve` publishes it over
+    // HTTPS on its host's tailnet name.
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:tinytrader"],
+      "ip":  ["tcp:443"],
+    },
+  ],
+
+  // Tailscale SSH, where a host runs it (the open-source tailscaled; the
+  // App Store app can't serve SSH, so a Mac running it takes plain SSH on port 22).
+  "ssh": [
+    {
+      "action": "check",
+      "src":    ["autogroup:member"],
+      "dst":    ["autogroup:self"],
+      "users":  ["autogroup:nonroot", "root"],
+    },
+    {
+      "action": "check",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:tinytrader"],
+      "users":  ["autogroup:nonroot"],
+    },
+  ],
+
+  // Checked by Tailscale whenever the policy is saved.
+  "tests": [
+    {
+      "src":    "tag:tinytrader",
+      "accept": ["tag:tinytrader:4646", "tag:tinytrader:4647", "tag:tinytrader:7600", "tag:tinytrader:7610", "tag:tinytrader:8888", "tag:tinytrader:9100", "tag:tinytrader:9107", "tag:tinytrader:9110", "tag:tinytrader:9114", "tag:tinytrader:9120", "tag:tinytrader:9121", "tag:tinytrader:9123", "tag:tinytrader:9124", "tag:tinytrader:9125", "tag:tinytrader:443", "tag:tinytrader:22"],
+      "deny":   ["tag:tinytrader:2375", "tag:tinytrader:7701", "tag:tinytrader:8080"],
+    },
+  ],
+}

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Give a rebuilt machine its old Tailscale address and name back, through the
+# Tailscale API with the site's OAuth client (its secrets/tailscale.env).
+# A wiped machine joins as a new device: a new address, and a name with -1,
+# -2 ... while its old, now offline, device still holds the name.
+#
+#   scripts/tailscale-pin HOSTNAME IP              list the devices and say what it
+#   scripts/tailscale-pin --dry-run HOSTNAME IP    would do (the default: changes nothing)
+#   scripts/tailscale-pin --apply HOSTNAME IP      rename the online device to HOSTNAME
+#                                                  and set its IPv4 address to IP
+#   scripts/tailscale-pin --apply --prune HOSTNAME IP
+#                                                  first delete the offline devices with
+#                                                  the same name (listed beforehand)
+#
+# HOSTNAME is the tailnet name's first label (inventory.nix hosts.*.tailnetName,
+# e.g. my-mac), IP the address to keep (inventory.nix
+# hosts.*.tailnetAddress). The devices it considers are those whose OS hostname
+# is HOSTNAME, or whose name is HOSTNAME or HOSTNAME-<n>: the one of them online
+# is the machine; the others, offline, are stale. It refuses when none or more
+# than one is online, or when IP is held by a device it wouldn't prune.
+#
+# Listing needs the client's devices:core:read scope; renaming, setting the
+# address and deleting need devices:core (write). Setting the address drops
+# the device's open connections: they reconnect to the new address.
+set -euo pipefail
+# shellcheck source=lib/site.sh
+. "$(dirname "$0")/lib/site.sh"
+export PATH="/run/current-system/sw/bin:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"
+# shellcheck source=lib/tailscale-api.sh
+. "$stack/scripts/lib/tailscale-api.sh"
+
+usage() { sed -n '/^#   scripts/,/^# HOSTNAME/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
+apply=no prune=no
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) apply=yes ;;
+    --dry-run) dry=yes ;;
+    --prune) prune=yes ;;
+    -h | --help) usage ;;
+    -*) usage ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+[ ${#args[@]} -eq 2 ] || usage
+host="$(tr '[:upper:]' '[:lower:]' <<<"${args[0]}")" ip="${args[1]}"
+[ "$apply" = no ] || [ "${dry:-}" != yes ] || { echo "--dry-run and --apply: pick one" >&2; exit 2; }
+[[ "$host" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "HOSTNAME is a name's first label, e.g. my-mac: $host" >&2; exit 2; }
+[[ "$ip" =~ ^100\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "IP is a tailnet IPv4 address (100.x.y.z): $ip" >&2; exit 2; }
+for c in sops jq curl; do command -v "$c" >/dev/null || { echo "$c not found" >&2; exit 1; }; done
+
+ts_login
+devices="$(ts_api GET 'tailnet/-/devices?fields=all')"
+
+# Every device, and those that are this host's.
+all="$(jq --arg h "$host" '
+  [.devices[] | {
+    id, name: (.name | split(".")[0]), hostname, user, tags: (.tags // []),
+    ipv4: ([.addresses[] | select(test("^[0-9.]+$"))][0]),
+    online: (.connectedToControl // false), lastSeen,
+    mine: (((.hostname // "") | ascii_downcase) == $h
+           or ((.name | split(".")[0]) | test("^" + $h + "(-[0-9]+)?$")))
+  }]' <<<"$devices")"
+mine="$(jq '[.[] | select(.mine)] | sort_by(.lastSeen) | reverse' <<<"$all")"
+
+echo "Devices named $host (or $host-<n>, or with that OS hostname):"
+jq -r '.[] | "  \(.name)\t\(.ipv4)\t\(if .online then "online" else "offline, last seen \(.lastSeen)" end)\thostname \(.hostname)\t\(if .tags == [] then .user else (.tags | join(",")) end)\t\(.id)"' <<<"$mine" | column -t -s $'\t'
+[ "$(jq length <<<"$mine")" -gt 0 ] || { echo "  none" >&2; exit 1; }
+
+online="$(jq '[.[] | select(.online)]' <<<"$mine")"
+case "$(jq length <<<"$online")" in
+  1) ;;
+  0) echo "None of them is online: start Tailscale on the machine first (scripts/tailscale-join)." >&2; exit 1 ;;
+  *) echo "More than one of them is online: which is the machine? Stop the others' Tailscale, or rename one in the admin console." >&2; exit 1 ;;
+esac
+target="$(jq '.[0]' <<<"$online")"
+tid="$(jq -r .id <<<"$target")"
+stale="$(jq '[.[] | select(.online | not)]' <<<"$mine")"
+holder="$(jq --arg ip "$ip" '[.[] | select(.ipv4 == $ip)][0] // null' <<<"$all")"
+
+echo
+echo "The machine: $(jq -r '"\(.name) (\(.ipv4), \(.id))"' <<<"$target")"
+steps=()
+if [ "$(jq length <<<"$stale")" -gt 0 ]; then
+  if [ "$prune" = yes ]; then
+    jq -r '.[] | "  delete \(.name) (\(.ipv4), offline since \(.lastSeen), \(.id))"' <<<"$stale"
+    steps+=(prune)
+  else
+    echo "  stale, offline (kept: --prune deletes them): $(jq -r 'map(.name) | join(", ")' <<<"$stale")"
+  fi
+fi
+if [ "$holder" != null ] && [ "$(jq -r .id <<<"$holder")" != "$tid" ]; then
+  hid="$(jq -r .id <<<"$holder")"
+  if jq -e --arg id "$hid" 'any(.[]; .id == $id)' <<<"$stale" >/dev/null; then
+    [ "$prune" = yes ] || { echo "$ip is held by the stale $(jq -r .name <<<"$holder"): --prune deletes it first" >&2; [ "$apply" = yes ] && exit 1; }
+  else
+    echo "$ip is held by $(jq -r '"\(.name) (\(.id))"' <<<"$holder"), which isn't this host's: not touching it" >&2
+    exit 1
+  fi
+fi
+if [ "$(jq -r .name <<<"$target")" != "$host" ]; then
+  if [ "$prune" = no ] && jq -e --arg h "$host" 'any(.[]; .name == $h)' <<<"$stale" >/dev/null; then
+    echo "the name $host is held by a stale device: --prune deletes it first" >&2
+    [ "$apply" = yes ] && exit 1
+  fi
+  echo "  rename $(jq -r .name <<<"$target") to $host"
+  steps+=(rename)
+fi
+if [ "$(jq -r .ipv4 <<<"$target")" != "$ip" ]; then
+  echo "  set its address $(jq -r .ipv4 <<<"$target") -> $ip"
+  steps+=(ip)
+fi
+if [ ${#steps[@]} -eq 0 ]; then
+  echo "  nothing to do: it is $host at $ip"
+  exit 0
+fi
+if [ "$apply" = no ]; then
+  echo "(dry run: --apply does it)"
+  exit 0
+fi
+
+for step in "${steps[@]}"; do
+  case "$step" in
+    prune)
+      for id in $(jq -r '.[].id' <<<"$stale"); do
+        ts_api DELETE "device/$id" >/dev/null
+        echo "deleted $id"
+      done
+      ;;
+    rename)
+      ts_api POST "device/$tid/name" "$(jq -nc --arg n "$host" '{name: $n}')" >/dev/null
+      echo "renamed it $host"
+      ;;
+    ip)
+      ts_api POST "device/$tid/ip" "$(jq -nc --arg ip "$ip" '{ipv4: $ip}')" >/dev/null
+      echo "set its address to $ip"
+      ;;
+  esac
+done
+got="$(ts_api GET "device/$tid?fields=all" | jq -r '"\(.name | split(".")[0]) \([.addresses[] | select(test("^[0-9.]+$"))][0])"')"
+echo "now: $got"
+[ "$got" = "$host $ip" ] || { echo "not what was asked: the admin console's Machines page shows why" >&2; exit 1; }

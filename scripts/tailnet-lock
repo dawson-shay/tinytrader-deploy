@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Tailnet Lock: new devices join the tailnet only when one of your own
+# machines signs them, so Tailscale's coordination server alone can't add a
+# device (https://tailscale.com/kb/1226/tailnet-lock). Run it on a machine
+# that holds a signing key (after init: this one, and the targets).
+#
+#   scripts/tailnet-lock init [--secrets FILE] SSH_TARGET...
+#                                               turn it on: this machine and each target become
+#                                               the signing machines (two or more in all); every
+#                                               current device is signed. The disablement secrets
+#                                               go straight into FILE, sops-encrypted (default:
+#                                               the site's secrets/tailnet-lock.yaml; or
+#                                               TAILNET_LOCK_SECRETS)
+#   scripts/tailnet-lock status                 trusted keys, and any devices locked out
+#   scripts/tailnet-lock sign NAME|SSH_TARGET   let a new or reinstalled device in: by its name in
+#                                               `status`'s locked-out list, or over SSH
+#   scripts/tailnet-lock trust SSH_TARGET       make another machine a signer (a new laptop, a
+#                                               rebuilt server)
+#   scripts/tailnet-lock untrust tlpub:KEY      drop a signer that's gone (a wiped machine's old key)
+#
+# Signing, init, trust and untrust go through sudo (tailscaled runs as root),
+# so run them in a terminal, where sudo can ask for the password.
+#
+# The disablement secrets turn Tailnet Lock off for the whole tailnet, and
+# Tailscale shows them only once, at init. They never reach the terminal:
+# init's output goes to a private temporary file, the secrets are encrypted
+# with sops (the .sops.yaml of the repository FILE is in), the result is
+# checked by decrypting it, and only then is the temporary file deleted. If
+# anything fails before that, the file is kept and its path printed.
+#
+# No signed auth keys: Tailscale advises against them (each one embeds a
+# signing key). A tagged host joined with scripts/tailscale-join is signed
+# afterwards, by its node key.
+set -euo pipefail
+export PATH="/run/current-system/sw/bin:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# nix-darwin's (or NixOS's) tailscale, or the Tailscale app's CLI on a Mac.
+remote_path='PATH=/run/current-system/sw/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH'
+
+usage() { sed -n '/^#   scripts/,/^#$/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2; exit 2; }
+need() { for c in "$@"; do command -v "$c" >/dev/null || { echo "$c not found" >&2; exit 1; }; done; }
+need tailscale jq
+
+lock_json() { tailscale lock status --json; }
+remote_lock_json() { ssh "$1" "$remote_path tailscale lock status --json"; }
+enabled() { [ "$(lock_json | jq -r .Enabled)" = true ]; }
+tlpub() { jq -r '.PublicKey // empty' | grep -E '^tlpub:[0-9a-f]+$'; }
+
+cmd="${1:-}"; [ $# -eq 0 ] || shift
+case "$cmd" in
+  init)
+    need sops git
+    secrets="${TAILNET_LOCK_SECRETS:-}"
+    if [ "${1:-}" = --secrets ]; then
+      [ $# -ge 2 ] || usage
+      secrets="$2"; shift 2
+    fi
+    if [ -z "$secrets" ]; then
+      # shellcheck source=lib/site.sh
+      . "$(dirname "$0")/lib/site.sh"
+      secrets="$site/secrets/tailnet-lock.yaml"
+    fi
+    [ $# -ge 1 ] || { echo "init needs at least one other signing machine (SSH_TARGET)" >&2; usage; }
+    ! enabled || { echo "Tailnet Lock is already on" >&2; exit 1; }
+    mkdir -p "$(dirname "$secrets")"
+    secrets_repo="$(git -C "$(dirname "$secrets")" rev-parse --show-toplevel 2>/dev/null)" ||
+      { echo "$(dirname "$secrets") isn't in a git repository (its .sops.yaml says who decrypts)" >&2; exit 1; }
+    secrets_file="$(cd "$(dirname "$secrets")" && pwd -P)/$(basename "$secrets")"
+    secrets_file="${secrets_file#"$(cd "$secrets_repo" && pwd -P)/"}"
+    keys=("$(lock_json | tlpub)")
+    for t in "$@"; do
+      k="$(remote_lock_json "$t" | tlpub)" || { echo "no Tailnet Lock key from $t" >&2; exit 1; }
+      keys+=("$k")
+    done
+    [ ! -e "$secrets_repo/$secrets_file" ] || { echo "$secrets_repo/$secrets_file already exists" >&2; exit 1; }
+    echo "Signing machines: this one and $*"
+    printf '  %s\n' "${keys[@]}"
+    tmp="$(umask 077 && mktemp -d)"
+    # init prints 3 secrets (one is enough to turn the lock off).
+    if ! sudo tailscale lock init --gen-disablements 3 --confirm "${keys[@]}" >"$tmp/init.out" 2>&1; then
+      sed 's/disablement-secret:[^[:space:]]*/disablement-secret:<hidden>/g' "$tmp/init.out" >&2
+      echo "init failed; its output (secrets hidden above) is in $tmp/init.out" >&2
+      exit 1
+    fi
+    sed 's/disablement-secret:[^[:space:]]*/disablement-secret:<hidden>/g' "$tmp/init.out"
+    n="$(grep -c 'disablement-secret:' "$tmp/init.out" || true)"
+    [ "$n" -ge 1 ] || { echo "no disablement secrets in init's output: keep $tmp/init.out" >&2; exit 1; }
+    {
+      echo "# Tailnet Lock disablement secrets (tinytrader-deploy scripts/tailnet-lock init)."
+      echo "# Any one turns Tailnet Lock off: tailscale lock disable <secret>"
+      echo "signing_keys:"; printf '  - %s\n' "${keys[@]}"
+      echo "disablement_secrets:"
+      grep -o 'disablement-secret:[^[:space:]]*' "$tmp/init.out" | sed 's/^/  - /'
+    } >"$tmp/plain.yaml"
+    if ! (cd "$secrets_repo" && sops --encrypt --filename-override "$secrets_file" --input-type yaml --output-type yaml "$tmp/plain.yaml" >"$secrets_file.new"); then
+      rm -f "$secrets_repo/$secrets_file.new"
+      echo "encrypting failed: the secrets are only in $tmp/init.out. Keep it until they're saved" >&2
+      exit 1
+    fi
+    mv "$secrets_repo/$secrets_file.new" "$secrets_repo/$secrets_file"
+    back="$(cd "$secrets_repo" && sops --decrypt "$secrets_file" | grep -c 'disablement-secret:' || true)"
+    [ "$back" = "$n" ] || { echo "the encrypted file doesn't decrypt to $n secrets: keep $tmp/init.out" >&2; exit 1; }
+    rm -P "$tmp/init.out" "$tmp/plain.yaml" 2>/dev/null || rm -f "$tmp/init.out" "$tmp/plain.yaml"
+    rmdir "$tmp"
+    echo "Saved $n disablement secrets, encrypted: $secrets_repo/$secrets_file (commit and push it)"
+    ;;
+  status)
+    lock_json | jq -r '
+      "Tailnet Lock: \(if .Enabled then "on" else "off" end)",
+      "this machine: \(.PublicKey)",
+      (if .Enabled then
+        "signing keys:", ((.TrustedKeys // [])[] | "  \(.Public)"),
+        "locked out:", ((.FilteredPeers // [])[] | "  \(.Name)  \(.NodeKey)")
+      else empty end)'
+    ;;
+  sign)
+    [ $# -eq 1 ] || usage
+    enabled || { echo "Tailnet Lock is off" >&2; exit 1; }
+    want="$1"
+    node="$(lock_json | jq -r --arg n "$want" '(.FilteredPeers // [])[] | select((.Name | split(".")[0]) == $n or .Name == $n) | .NodeKey' | head -1)"
+    rot=""
+    if [ -z "$node" ]; then
+      # Not in the locked-out list by that name: ask the machine itself.
+      j="$(ssh -o ConnectTimeout=10 "$want" "$remote_path tailscale lock status --json")" || { echo "$want: not locked out here, and not reachable over SSH" >&2; exit 1; }
+      node="$(jq -r .NodeKey <<<"$j")"
+      rot="$(jq -r '.PublicKey // empty' <<<"$j")"
+    fi
+    [[ "$node" =~ ^nodekey:[0-9a-f]+$ ]] || { echo "no node key for $want" >&2; exit 1; }
+    echo "signing $want ($node)"
+    sudo tailscale lock sign "$node" ${rot:+"$rot"}
+    ;;
+  trust)
+    [ $# -eq 1 ] || usage
+    enabled || { echo "Tailnet Lock is off (init first)" >&2; exit 1; }
+    k="$(remote_lock_json "$1" | tlpub)" || { echo "no Tailnet Lock key from $1" >&2; exit 1; }
+    echo "adding $1's signing key $k"
+    sudo tailscale lock add "$k"
+    ;;
+  untrust)
+    [ $# -eq 1 ] && [[ "$1" =~ ^tlpub:[0-9a-f]+$ ]] || usage
+    sudo tailscale lock remove "$1"
+    ;;
+  *) usage ;;
+esac
