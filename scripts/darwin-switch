@@ -57,4 +57,4 @@ fi
 system="$(nix build --no-link --print-out-paths "$site#darwinConfigurations.$host.system" ${override[@]+"${override[@]}"})"
 echo "activating $system"
 sudo -H "$(command -v nix-env)" -p /nix/var/nix/profiles/system --set "$system"
-sudo "$system/activate"
+sudo -H "$system/activate"
