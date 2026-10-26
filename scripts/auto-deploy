@@ -81,11 +81,13 @@ main() {
     exec > >(tee -a "$log_file") 2>&1
   fi
 
-  if [ -e "$off_file" ]; then
+  # --mark-deployed deploys nothing, so neither the kill switch nor the
+  # window stops it (it is how a paused cutover records its checkouts).
+  if [ -e "$off_file" ] && [ "$mark" = 0 ]; then
     if [ "$dry" = 0 ]; then say "kill switch $off_file is on: doing nothing"; return 0; fi
     log "(dry run) kill switch $off_file is on: a real run would do nothing"
   fi
-  if ! window; then
+  if [ "$mark" = 0 ] && ! window; then
     if [ "$dry" = 0 ]; then say "$why_closed"; return 0; fi
     log "(dry run) $why_closed: a real run would do nothing now"
   fi
