@@ -74,6 +74,11 @@ notices.
 
 ## What you'll get
 
+`watch` has one set of disk thresholds per host. A host that watches only
+`/` uses `monitoring.systemDisk` (by default a warning at 85% used, high
+priority at 95% or under 20 GiB free); a host that watches other disks too
+keeps `monitoring.disk` (decision [0016](decisions/0016-disk-hygiene.md)).
+
 | Notice | When | Repeats |
 |---|---|---|
 | High priority | Docker engine not answering; an expected container missing, stopped or restarting; the console not answering; a service `failed`; a native service not running; a disk at `monitoring.disk.critPercent` or under `minFreeGiB` free, or not mounted | every 30 min |

@@ -660,8 +660,11 @@ Clean, in this order, until there is room again (well above the monitor's
 1. **Agent worktrees** that are finished: `git -C ~/repos/<repo> worktree list`,
    then `git -C ~/repos/<repo> worktree remove <path>` (check `git -C <path>
    status` first: uncommitted work is lost). `git worktree prune` after.
-2. **Rust build output.** If every checkout shares one cargo target (see
-   [Agent hygiene](#agent-hygiene)), remove it when no build is running.
+2. **Rust build output.** The daily `disk-hygiene` job removes idle targets
+   (decision [0016](decisions/0016-disk-hygiene.md)); to see what it would
+   remove now: `DISK_HYGIENE_ROOTS=repos:.cache/cargo-target sh
+   <stack>/deploy/nomad/disk-hygiene.sh --dry-run`. A shared target (see
+   [Agent hygiene](#agent-hygiene)) can go when no build is running.
    Older checkouts may still have their own:
    `find ~/repos -maxdepth 3 -type d -name target -prune -exec du -sh {} +`.
 3. **Nix:** `nix store gc` (unreferenced paths only; generations stay for
@@ -806,7 +809,7 @@ without it the monitors only log (`~/Library/Logs/tinytrader/watch.log`).
 | Notice | Go to |
 |---|---|
 | Docker engine not answering | [The Docker engine is down](#the-docker-engine-is-down) |
-| A disk at 90%/95%, under the free-space floor, or not mounted | [The disk is full](#the-disk-is-full); a drive unplugged: plug it in, `launchctl kickstart -k gui/$(id -u)/com.tinytrader.store` |
+| A disk at its warning or high-priority threshold, under the free-space floor, or not mounted | [The disk is full](#the-disk-is-full); a drive unplugged: plug it in, `launchctl kickstart -k gui/$(id -u)/com.tinytrader.store` |
 | A container missing, stopped or restarting | `docker logs` for it, then the section for its kind |
 | The console not answering, or a service `failed` / degraded | [The console is down](#the-console-is-down), or that service's logs |
 | A native service not running | `launchctl print system/com.tinytrader.<name>` (a daemon) or `gui/$(id -u)/com.tinytrader.<name>` (an agent), and its log |
@@ -962,11 +965,33 @@ make a new operator key, put its public half in the inventory
   Merging is the operator's call.
 - **Remove your worktree when done:** `git -C ~/repos/<repo> worktree remove
   ~/repos/wt/<name>`, and delete scratch files.
-- **One cargo target for every checkout:** point every build at one shared
-  target directory (`~/.cargo/config.toml`, from the machine's
-  configuration). Don't override `CARGO_TARGET_DIR` or create per-worktree
-  `target/` folders. Concurrent builds wait for cargo's lock; that is
-  expected.
+- **One cargo target per repository, per machine** (decision
+  [0016](decisions/0016-disk-hygiene.md)): every checkout of a repository,
+  its worktrees included, builds into
+  `~/.cache/cargo-target/<repo>/target`, never a `target/` of its own.
+  This stack's `scripts/cargo-shim` sets `CARGO_TARGET_DIR` so, from the
+  repository's common Git folder (a worktree gets its main checkout's).
+  Your machines repository installs it as `cargo` on PATH ahead of the real
+  one, for example in a directory first on PATH in `~/.zshenv`, so it
+  covers interactive shells, `zsh -c` and agents' shells alike. A
+  `CARGO_TARGET_DIR` already set wins: the Nomad build and test jobs set
+  the deploy checkout's own (`<checkout>/target`), so a working copy's
+  build never overwrites the binaries a deploy built. Concurrent builds of
+  one repository wait for cargo's lock; that is expected. The
+  `disk-hygiene` job deletes a target idle for 7 days (with
+  `.cache/cargo-target` among the node's `cleanRoots`).
+
+  Moving from one global target (`[build] target-dir` in
+  `~/.cargo/config.toml`), once per machine:
+  1. Drop `target-dir` from `~/.cargo/config.toml` in your machines
+     repository, with no fallback: a global target nobody cleans is what
+     filled the disk, and the per-repository ones would sit inside it.
+  2. Install the shim and switch the machine.
+  3. Outside market hours, with no build running, delete the old global
+     target's own folders by hand:
+     `cd ~/.cache/cargo-target && rm -rf debug release CACHEDIR.TAG .rustc_info.json`
+     (and any target triple folder, such as `aarch64-apple-darwin`),
+     leaving only `<repo>/target` folders.
 - **No large outputs on the system disk:** no datasets, downloads or long
   logs under `~` or `/tmp`. Research output goes through the store or to a
   data root, with the operator's say.

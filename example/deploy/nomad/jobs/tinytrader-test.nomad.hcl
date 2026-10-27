@@ -82,6 +82,11 @@ job "tinytrader-test" {
           "timeout", "5400", "cargo", "test", "-j", "2", "-p", "${NOMAD_META_package}",
         ]
       }
+      # The deploy checkout's own target, never shared with working copies
+      # (their builds would overwrite its binaries; docs/decisions/0016).
+      env {
+        CARGO_TARGET_DIR = "${meta.tinytrader_src}/target"
+      }
       resources {
         cpu    = 2000
         memory = 2048

@@ -34,7 +34,8 @@ a comment on every field. In brief:
 - `secrets`: the operator and recovery keys, each host's key, the
   `operatorKeyHosts`, the `hostOnly` files and who decrypts each file
   (decision 0004).
-- `dataRoots`, `tailnet` (`domain`, `tag`), `monitoring`, `backup`.
+- `dataRoots`, `tailnet` (`domain`, `tag`), `monitoring` (`disk`, and
+  `systemDisk` for hosts that watch only `/`), `backup`.
 - `deployment`: what the stack needs beyond the placement map (not part of
   the console's topology):
   - `name`: the Compose project (compose.yaml's `name` must match), the
@@ -58,7 +59,8 @@ a comment on every field. In brief:
     the stack (user names, machine names, account names), checked with its
     tailnet domain and `name` by the site's `checks.stack-generic`.
   - `nomad`: the batch scheduler's policy (`server`, `datacenter`,
-    `nodes.<host>` with `pool`, `memoryMB`, `cpuMHz`, `feed`, `builds`, and
+    `nodes.<host>` with `pool`, `memoryMB`, `cpuMHz`, `feed`, `builds`,
+    `cleanRoots` (where the disk-hygiene job deletes idle Rust targets), and
     `yieldTo`), where the inventory places `nomad` on hosts
     ([docs/batch-jobs.md](batch-jobs.md)). Its job specs are the site's
     `deploy/nomad/jobs/`.
