@@ -809,7 +809,7 @@ without it the monitors only log (`~/Library/Logs/tinytrader/watch.log`).
 | Notice | Go to |
 |---|---|
 | Docker engine not answering | [The Docker engine is down](#the-docker-engine-is-down) |
-| A disk at 85%/95%, under the free-space floor, or not mounted | [The disk is full](#the-disk-is-full); a drive unplugged: plug it in, `launchctl kickstart -k gui/$(id -u)/com.tinytrader.store` |
+| A disk at its warning or high-priority threshold, under the free-space floor, or not mounted | [The disk is full](#the-disk-is-full); a drive unplugged: plug it in, `launchctl kickstart -k gui/$(id -u)/com.tinytrader.store` |
 | A container missing, stopped or restarting | `docker logs` for it, then the section for its kind |
 | The console not answering, or a service `failed` / degraded | [The console is down](#the-console-is-down), or that service's logs |
 | A native service not running | `launchctl print system/com.tinytrader.<name>` (a daemon) or `gui/$(id -u)/com.tinytrader.<name>` (an agent), and its log |
@@ -969,23 +969,29 @@ make a new operator key, put its public half in the inventory
   [0016](decisions/0016-disk-hygiene.md)): every checkout of a repository,
   its worktrees included, builds into
   `~/.cache/cargo-target/<repo>/target`, never a `target/` of its own.
-  The machine's shell configuration (your machines repository) sets
-  `CARGO_TARGET_DIR` from the repository's common Git folder, so a worktree
-  gets its main checkout's; for zsh:
+  This stack's `scripts/cargo-shim` sets `CARGO_TARGET_DIR` so, from the
+  repository's common Git folder (a worktree gets its main checkout's).
+  Your machines repository installs it as `cargo` on PATH ahead of the real
+  one, for example in a directory first on PATH in `~/.zshenv`, so it
+  covers interactive shells, `zsh -c` and agents' shells alike. A
+  `CARGO_TARGET_DIR` already set wins: the Nomad build and test jobs set
+  the deploy checkout's own (`<checkout>/target`), so a working copy's
+  build never overwrites the binaries a deploy built. Concurrent builds of
+  one repository wait for cargo's lock; that is expected. The
+  `disk-hygiene` job deletes a target idle for 7 days (with
+  `.cache/cargo-target` among the node's `cleanRoots`).
 
-  ```sh
-  cargo_target() {
-    local common
-    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || { unset CARGO_TARGET_DIR; return; }
-    export CARGO_TARGET_DIR="$HOME/.cache/cargo-target/$(basename "${common%/.git}")/target"
-  }
-  autoload -Uz add-zsh-hook && add-zsh-hook chpwd cargo_target && cargo_target
-  ```
-
-  Don't set it by hand to anything else. Concurrent builds of one
-  repository wait for cargo's lock; that is expected. The `disk-hygiene`
-  job deletes a target idle for 7 days (with `.cache/cargo-target` among
-  the node's `cleanRoots`).
+  Moving from one global target (`[build] target-dir` in
+  `~/.cargo/config.toml`), once per machine:
+  1. Drop `target-dir` from `~/.cargo/config.toml` in your machines
+     repository, with no fallback: a global target nobody cleans is what
+     filled the disk, and the per-repository ones would sit inside it.
+  2. Install the shim and switch the machine.
+  3. Outside market hours, with no build running, delete the old global
+     target's own folders by hand:
+     `cd ~/.cache/cargo-target && rm -rf debug release CACHEDIR.TAG .rustc_info.json`
+     (and any target triple folder, such as `aarch64-apple-darwin`),
+     leaving only `<repo>/target` folders.
 - **No large outputs on the system disk:** no datasets, downloads or long
   logs under `~` or `/tmp`. Research output goes through the store or to a
   data root, with the operator's say.

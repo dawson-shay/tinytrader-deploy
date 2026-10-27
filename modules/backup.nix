@@ -58,7 +58,7 @@ let
         export BACKUP_COMPOSE="''${BACKUP_COMPOSE:-${compose}}"
         export BACKUP_KEEP_DAILY="''${BACKUP_KEEP_DAILY:-${toString cfg.keep.daily}}"
         export BACKUP_KEEP_WEEKLY="''${BACKUP_KEEP_WEEKLY:-${toString cfg.keep.weekly}}"
-        export BACKUP_MIN_FREE_GIB="''${BACKUP_MIN_FREE_GIB:-${toString (inventory.monitoring.disk.minFreeGiB or 20)}}"
+        export BACKUP_MIN_FREE_GIB="''${BACKUP_MIN_FREE_GIB:-${toString inventory.monitoring.disk.minFreeGiB}}"
         export BACKUP_RECIPIENTS="''${BACKUP_RECIPIENTS-${lib.concatStringsSep " " recipients}}"
         export BACKUP_PROJECT="''${BACKUP_PROJECT:-${site.name}}"
       ''

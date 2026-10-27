@@ -1,7 +1,7 @@
 # checks.<system>.disk-hygiene: deploy/nomad/disk-hygiene.sh on disposable
-# folders under a temporary HOME, the target step only (no nix, no Docker).
-# Run by `nix flake check`; by hand: sh checks/disk-hygiene-test.sh
-# deploy/nomad/disk-hygiene.sh. $1 is the script.
+# folders under a temporary HOME, the target step only (nix and Docker in
+# dry runs), and scripts/cargo-shim. Run by `nix flake check`; by hand:
+# sh checks/disk-hygiene-test.sh deploy/nomad/disk-hygiene.sh scripts/cargo-shim.
 set -eu
 script="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
 work="$(mktemp -d)"
@@ -33,6 +33,9 @@ mkdir -p "$r/maven/target" && echo x >"$r/maven/target/app.jar" && old "$r/maven
 mkdir -p "$HOME/.cache/cargo-target/repo/target"
 printf 'Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo.\n' >"$HOME/.cache/cargo-target/repo/target/CACHEDIR.TAG"
 old "$HOME/.cache/cargo-target/repo/target"
+# The old global target's own folders, beside the per-repository ones.
+mkdir -p "$HOME/.cache/cargo-target/debug" && echo x >"$HOME/.cache/cargo-target/debug/old-bin"
+old "$HOME/.cache/cargo-target/debug"
 crate "$work/outside/linked" 4096 # reachable only through a symlink
 ln -s "$work/outside" "$r/link"
 crate "$work/elsewhere" 4096 # not under a root at all
@@ -57,6 +60,7 @@ run
 gone "$r/old/target"
 kept "$r/old/Cargo.toml"
 gone "$HOME/.cache/cargo-target/repo/target"
+kept "$HOME/.cache/cargo-target/debug/old-bin" # deleted once, by hand
 kept "$r/wt/fresh/target/debug/out"
 logged "kept $r/wt/fresh/target: modified in the last 7 days"
 if command -v lsof >/dev/null; then
@@ -79,7 +83,32 @@ if [ -d /Volumes ]; then
   logged "under /Volumes, never touched"
 fi
 
+echo "== no Docker step while auto-deploy's lock is open (a dry run)"
+: >"$HOME/auto-deploy.lock"
+kill "$holder"; wait "$holder" 2>/dev/null || true
+tail -f "$HOME/auto-deploy.lock" >/dev/null 2>&1 &
+holder=$!
+sleep 1
+(export DISK_HYGIENE_STEPS=docker DISK_HYGIENE_DEPLOY_LOCK=auto-deploy.lock; run --dry-run)
+logged "docker: auto-deploy is running"
+
 echo "== bad settings stop it"
 if DISK_HYGIENE_DRY_RUN=yes sh "$script" >/dev/null 2>&1; then fail "DRY_RUN=yes accepted"; fi
 if DISK_HYGIENE_TARGET_DAYS=x sh "$script" >/dev/null 2>&1; then fail "TARGET_DAYS=x accepted"; fi
+echo "== the cargo shim: one target per repository, worktrees included"
+shim="$(cd "$(dirname "$2")" && pwd -P)/$(basename "$2")"
+mkdir -p "$work/real" "$work/shim" && cp "$shim" "$work/shim/cargo"
+printf '#!/bin/sh\necho "${CARGO_TARGET_DIR:-unset}"\n' >"$work/real/cargo" && chmod +x "$work/real/cargo"
+g() { git -c user.name=t -c user.email=t@example.invalid "$@" >/dev/null 2>&1; }
+g init -q "$work/src/myrepo" && g -C "$work/src/myrepo" commit -q --allow-empty -m x
+g -C "$work/src/myrepo" worktree add -q "$work/wt/feature"
+want="$HOME/.cache/cargo-target/myrepo/target"
+for d in "$work/src/myrepo" "$work/wt/feature"; do
+  got="$(cd "$d" && PATH="$work/shim:$work/real:$PATH" cargo)"
+  [ "$got" = "$want" ] || fail "shim in $d: $got"
+done
+got="$(cd "$work/wt/feature" && CARGO_TARGET_DIR=/kept PATH="$work/shim:$work/real:$PATH" cargo)"
+[ "$got" = /kept ] || fail "shim overrode CARGO_TARGET_DIR: $got"
+got="$(cd "$work" && PATH="$work/shim:$work/real:$PATH" cargo)"
+[ "$got" = unset ] || fail "shim outside a repository: $got"
 echo "disk-hygiene: ok"

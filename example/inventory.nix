@@ -92,9 +92,15 @@
 
   # Each host's monitor (tinytrader's `watch`, docs/decisions/0006).
   monitoring = {
-    # The stack's defaults (docs/decisions/0016): a warning below 15% free,
-    # high priority at 95% used or below 20 GiB free.
+    # Hosts that watch other disks too (a store's drives).
     disk = {
+      warnPercent = 90;
+      critPercent = 95;
+      minFreeGiB = 10;
+    };
+    # Hosts that watch only "/" (the stack's defaults, docs/decisions/0016):
+    # below 15% free a warning, below 20 GiB high priority.
+    systemDisk = {
       warnPercent = 85;
       critPercent = 95;
       minFreeGiB = 20;

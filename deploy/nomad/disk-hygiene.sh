@@ -8,9 +8,13 @@
 #            target beside a Cargo.toml, or holding cargo's CACHEDIR.TAG (a
 #            shared CARGO_TARGET_DIR), with nothing in it modified for
 #            DISK_HYGIENE_TARGET_DAYS days and nothing in it open (cargo
-#            holds its build lock open for a whole build; rustc its outputs)
+#            holds its build lock open for a whole build; rustc its outputs;
+#            a running binary its executable). Per-repository targets
+#            (~/.cache/cargo-target/<repo>/target) are targets like any other
 #   nix      nix-collect-garbage --delete-older-than DISK_HYGIENE_NIX_DAYS d
-#   docker   docker system prune -f, where an engine answers. Never --volumes
+#   docker   docker image prune -f and docker builder prune -f --filter
+#            until=336h, where an engine answers and no auto-deploy holds
+#            DISK_HYGIENE_DEPLOY_LOCK. Containers, networks and volumes stay
 #
 #   DISK_HYGIENE_ROOTS        "dir:dir": absolute, or relative to $HOME. Never
 #                             under /Volumes; symlinks are not followed, and
@@ -19,6 +23,8 @@
 #   DISK_HYGIENE_TARGET_DAYS  7
 #   DISK_HYGIENE_NIX_DAYS     14
 #   DISK_HYGIENE_STEPS        "targets nix docker"
+#   DISK_HYGIENE_DEPLOY_LOCK  auto-deploy's lock file (relative to $HOME, or
+#                             absolute): open in a process means a deploy is on
 set -eu
 dry="${DISK_HYGIENE_DRY_RUN:-0}"
 [ "${1:-}" = --dry-run ] && dry=1
@@ -36,11 +42,11 @@ physical() { (cd -P -- "$1" 2>/dev/null && pwd -P) || true; }
 avail() { df -Pk "$HOME" | awk 'NR == 2 { print $4 * 1024 }'; }
 before="$(avail)"
 
-# 0 when any process this user can see has a file (or its cwd) in $1, or
-# when that can't be told.
+# Every file open in a process this user can see, once per run (empty: lsof
+# can't say, and everything counts as in use).
+open="$(command -v lsof >/dev/null && lsof -n -P -w -F n 2>/dev/null || true)"
+# 0 when a process has a file (or its cwd) in $1, or when that can't be told.
 in_use() {
-  command -v lsof >/dev/null || return 0
-  open="$(lsof -n -P -w -F n 2>/dev/null || true)"
   [ -n "$open" ] || return 0
   printf '%s\n' "$open" | awk -v t="$1" '/^n/ { n = substr($0, 2); if (n == t || index(n, t "/") == 1) { f = 1; exit } } END { exit !f }'
 }
@@ -102,12 +108,17 @@ for step in $steps; do
       fi
       ;;
     docker)
-      if ! command -v docker >/dev/null || ! timeout 20 docker info >/dev/null 2>&1; then
+      lock="${DISK_HYGIENE_DEPLOY_LOCK:-}"
+      case "$lock" in "" | /*) ;; *) lock="$HOME/$lock" ;; esac
+      if [ -n "$lock" ] && [ -e "$lock" ] && in_use "$lock"; then
+        say "docker: auto-deploy is running (or lsof can't say): skipped"
+      elif ! command -v docker >/dev/null || ! timeout 20 docker info >/dev/null 2>&1; then
         say "docker: no engine answering here: skipped"
       elif [ "$dry" = 1 ]; then
-        say "docker: would run docker system prune -f (volumes kept)"
+        say "docker: would run docker image prune -f; docker builder prune -f --filter until=336h"
       else
-        say "docker: $(docker system prune -f 2>&1 | tail -n1)"
+        say "docker: images: $(docker image prune -f 2>&1 | tail -n1)"
+        say "docker: build cache: $(docker builder prune -f --filter until=336h 2>&1 | tail -n1)"
       fi
       ;;
     *) say "unknown step $step"; exit 2 ;;

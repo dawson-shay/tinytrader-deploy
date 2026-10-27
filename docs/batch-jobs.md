@@ -87,7 +87,7 @@ what each asks of a scheduler.
 | Parameter | `package`: `^[a-z][a-z0-9-]*$` (a Cargo workspace package) |
 | Command | `cargo build -j 2 --release -p {package}`, under `taskpolicy -b` |
 | Working directory | `${TINYTRADER_SITE}/../tinytrader` (the deploy checkout of tinytrader) |
-| Needs | `cargo` on PATH (`~/.nix-profile/bin`), `HOME` (the shared cargo target, `~/.cargo/config.toml`) |
+| Needs | `cargo` on PATH (`~/.nix-profile/bin`), `HOME`; `CARGO_TARGET_DIR` is the checkout's own `target` (the jobs set it; [decision 0016](decisions/0016-disk-hygiene.md)) |
 | Deadline | 5400 s |
 | Class | background. No builds 09:25-16:20 New York time on trading days, so queue it `after-close` or `background-may-run` |
 

@@ -2,8 +2,9 @@
 # docs/decisions/0016), natively (raw_exec, as the agent's user) under macOS
 # background QoS (taskpolicy -b): idle Rust target/ folders under the node's
 # cleanRoots (inventory.nix deployment.nomad.nodes.<host>), then
-# nix-collect-garbage --delete-older-than 14d, then docker system prune -f
-# where an engine answers (volumes kept). After the close: never 09:25-16:20
+# nix-collect-garbage --delete-older-than 14d, then docker image prune -f and
+# docker builder prune -f --filter until=336h where an engine answers and no
+# auto-deploy is running (containers, networks and volumes stay). After the close: never 09:25-16:20
 # New York time on trading days (CONTRIBUTING.md).
 # A sysbatch job: each run puts one allocation on every eligible node.
 # Registered by scripts/job register; `nomad job periodic force disk-hygiene`
@@ -75,8 +76,9 @@ job "disk-hygiene" {
         right_delimiter = ":disk]]"
       }
       env {
-        DISK_HYGIENE_ROOTS   = "${meta.disk_hygiene_roots}"
-        DISK_HYGIENE_DRY_RUN = "${NOMAD_META_dry_run}"
+        DISK_HYGIENE_ROOTS       = "${meta.disk_hygiene_roots}"
+        DISK_HYGIENE_DRY_RUN     = "${NOMAD_META_dry_run}"
+        DISK_HYGIENE_DEPLOY_LOCK = "${meta.auto_deploy_lock}"
       }
       resources {
         cpu    = 500

@@ -74,9 +74,10 @@ notices.
 
 ## What you'll get
 
-The stack's disk thresholds, when the inventory's `monitoring.disk` doesn't
-set them: a warning at 85% used, high priority at 95% or under 20 GiB free
-(decision [0016](decisions/0016-disk-hygiene.md)).
+`watch` has one set of disk thresholds per host. A host that watches only
+`/` uses `monitoring.systemDisk` (by default a warning at 85% used, high
+priority at 95% or under 20 GiB free); a host that watches other disks too
+keeps `monitoring.disk` (decision [0016](decisions/0016-disk-hygiene.md)).
 
 | Notice | When | Repeats |
 |---|---|---|

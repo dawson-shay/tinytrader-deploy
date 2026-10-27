@@ -34,7 +34,8 @@ a comment on every field. In brief:
 - `secrets`: the operator and recovery keys, each host's key, the
   `operatorKeyHosts`, the `hostOnly` files and who decrypts each file
   (decision 0004).
-- `dataRoots`, `tailnet` (`domain`, `tag`), `monitoring`, `backup`.
+- `dataRoots`, `tailnet` (`domain`, `tag`), `monitoring` (`disk`, and
+  `systemDisk` for hosts that watch only `/`), `backup`.
 - `deployment`: what the stack needs beyond the placement map (not part of
   the console's topology):
   - `name`: the Compose project (compose.yaml's `name` must match), the

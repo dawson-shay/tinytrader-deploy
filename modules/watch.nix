@@ -36,21 +36,28 @@ let
   here = name: placedHere name || lib.elem name native;
   local = name: "http://127.0.0.1:${toString services.${name}.ports.http}";
   notify = site.secret monitoring.notify.file;
-  # Below 15% or 20 GiB free, whichever is more (docs/decisions/0016): a
-  # warning at 85% used, high priority under 20 GiB.
-  disk = {
-    warnPercent = 85;
-    critPercent = 95;
-    minFreeGiB = 20;
-  }
-  // (monitoring.disk or { });
+  disks = (inventory.hosts.${host}.watch.disks or [ "/" ]) ++ extraDisks;
+  # `watch` has one set of thresholds per host (per-disk ones would be a
+  # tinytrader change). A host watching only its system disk gets
+  # monitoring.systemDisk: by default a warning at 85% used, high priority
+  # under 20 GiB, so below 15% or 20 GiB free, whichever is more
+  # (docs/decisions/0016). A host with other disks (a full archive drive
+  # would warn on every run) keeps monitoring.disk.
+  disk =
+    if disks == [ "/" ] then
+      {
+        warnPercent = 85;
+        critPercent = 95;
+        minFreeGiB = 20;
+      }
+      // (monitoring.systemDisk or { })
+    else
+      monitoring.disk;
 in
 {
   environment = {
     WATCH_HOST = host;
-    WATCH_DISKS = lib.concatStringsSep " " (
-      (inventory.hosts.${host}.watch.disks or [ "/" ]) ++ extraDisks
-    );
+    WATCH_DISKS = lib.concatStringsSep " " disks;
     WATCH_DISK_WARN = toString disk.warnPercent;
     WATCH_DISK_CRIT = toString disk.critPercent;
     WATCH_DISK_MIN_FREE_GIB = toString disk.minFreeGiB;

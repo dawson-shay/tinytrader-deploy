@@ -35,6 +35,7 @@
 #   gate_yield_to   name=url;... of the yieldTo services' health, on a feed host
 #   feed            "true" or "false"
 #   disk_hygiene_roots  cleanRoots, ":"-separated (empty: none)
+#   auto_deploy_lock    auto-deploy's lock, relative to the home (scripts/auto-deploy)
 {
   site,
   host,
@@ -93,6 +94,7 @@ in
     meta = {
       feed = if node.feed then "true" else "false";
       disk_hygiene_roots = builtins.concatStringsSep ":" node.cleanRoots;
+      auto_deploy_lock = ".local/state/${site.name}/auto-deploy.lock";
       site_checkout = siteCheckout;
       docker_network = "${site.name}_default";
       # Research's reads of the console: by name on its host, else its

@@ -1,0 +1,23 @@
+#!/bin/sh
+# cargo, building into one target per repository on this machine
+# (docs/decisions/0016): CARGO_TARGET_DIR is
+# ~/.cache/cargo-target/<repo>/target, <repo> named by the repository's
+# common Git folder, so every worktree of it shares its main checkout's.
+# Your machines repository installs it as `cargo` on PATH ahead of the
+# real one (docs/operations.md, Agent hygiene); it then covers every
+# shell, interactive or not, agents' too. A CARGO_TARGET_DIR already set
+# is kept (the Nomad build jobs set their own); outside a repository it
+# changes nothing.
+set -eu
+if [ -z "${CARGO_TARGET_DIR:-}" ] && common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  repo="$(basename "${common%/.git}")"
+  CARGO_TARGET_DIR="$HOME/.cache/cargo-target/${repo%.git}/target"
+  export CARGO_TARGET_DIR
+fi
+# The next cargo on PATH that isn't this one.
+IFS=:
+for d in $PATH; do
+  if [ -x "$d/cargo" ] && ! [ "$d/cargo" -ef "$0" ]; then exec "$d/cargo" "$@"; fi
+done
+echo "cargo-shim: no other cargo on PATH" >&2
+exit 127
