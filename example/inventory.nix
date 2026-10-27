@@ -92,10 +92,12 @@
 
   # Each host's monitor (tinytrader's `watch`, docs/decisions/0006).
   monitoring = {
+    # The stack's defaults (docs/decisions/0016): a warning below 15% free,
+    # high priority at 95% used or below 20 GiB free.
     disk = {
-      warnPercent = 90;
+      warnPercent = 85;
       critPercent = 95;
-      minFreeGiB = 10;
+      minFreeGiB = 20;
     };
     # The secrets file and its keys: the ntfy topic URL, and each host's
     # healthchecks.io ping URL.
@@ -195,6 +197,12 @@
           cpuMHz = 10000;
           feed = true;
           builds = true;
+          # The disk-hygiene job's roots: agent worktrees and the shared
+          # cargo targets (docs/operations.md, Agent hygiene).
+          cleanRoots = [
+            "repos"
+            ".cache/cargo-target"
+          ];
         };
         vault = {
           memoryMB = 3072;

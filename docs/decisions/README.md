@@ -21,3 +21,4 @@ were about the first deployment alone and stayed in its site
 | [0013](0013-databento-key-held-by-its-services.md) | The Databento key is held by databento-jobs and the OPRA relays alone | Native daemons as their own user; the key is host-only, never the operator key's. |
 | [0014](0014-nomad-batch-scheduler.md) | Nomad runs batch work, on every machine in the pool | Agents from the inventory, the gate for start conditions, ACLs on; policy and job specs are the site's. |
 | [0015](0015-stack-and-site.md) | A public stack, a private site | The stack is generic, a new repository; everything specific comes from the site. |
+| [0016](0016-disk-hygiene.md) | The Macs clean up after builds, and warn before the disk is full | A cargo target per repository, a daily disk-hygiene job, disk warnings below 15% or 20 GiB free. |

@@ -58,7 +58,8 @@ a comment on every field. In brief:
     the stack (user names, machine names, account names), checked with its
     tailnet domain and `name` by the site's `checks.stack-generic`.
   - `nomad`: the batch scheduler's policy (`server`, `datacenter`,
-    `nodes.<host>` with `pool`, `memoryMB`, `cpuMHz`, `feed`, `builds`, and
+    `nodes.<host>` with `pool`, `memoryMB`, `cpuMHz`, `feed`, `builds`,
+    `cleanRoots` (where the disk-hygiene job deletes idle Rust targets), and
     `yieldTo`), where the inventory places `nomad` on hosts
     ([docs/batch-jobs.md](batch-jobs.md)). Its job specs are the site's
     `deploy/nomad/jobs/`.

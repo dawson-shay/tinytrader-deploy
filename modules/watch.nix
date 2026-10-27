@@ -36,6 +36,14 @@ let
   here = name: placedHere name || lib.elem name native;
   local = name: "http://127.0.0.1:${toString services.${name}.ports.http}";
   notify = site.secret monitoring.notify.file;
+  # Below 15% or 20 GiB free, whichever is more (docs/decisions/0016): a
+  # warning at 85% used, high priority under 20 GiB.
+  disk = {
+    warnPercent = 85;
+    critPercent = 95;
+    minFreeGiB = 20;
+  }
+  // (monitoring.disk or { });
 in
 {
   environment = {
@@ -43,9 +51,9 @@ in
     WATCH_DISKS = lib.concatStringsSep " " (
       (inventory.hosts.${host}.watch.disks or [ "/" ]) ++ extraDisks
     );
-    WATCH_DISK_WARN = toString monitoring.disk.warnPercent;
-    WATCH_DISK_CRIT = toString monitoring.disk.critPercent;
-    WATCH_DISK_MIN_FREE_GIB = toString monitoring.disk.minFreeGiB;
+    WATCH_DISK_WARN = toString disk.warnPercent;
+    WATCH_DISK_CRIT = toString disk.critPercent;
+    WATCH_DISK_MIN_FREE_GIB = toString disk.minFreeGiB;
     WATCH_NEVER_PORTS = lib.concatMapStringsSep " " toString monitoring.gatewayPorts;
   }
   // lib.optionalAttrs (native != [ ]) {

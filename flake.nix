@@ -69,6 +69,14 @@
         // {
           # Nothing deployment-specific in this repository (checks/generic.nix).
           generic = import ./checks/generic.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+          # The disk-hygiene job's script on disposable folders (checks/disk-hygiene-test.sh).
+          disk-hygiene =
+            let
+              pkgs = nixpkgs.legacyPackages.${system};
+            in
+            pkgs.runCommand "disk-hygiene" { nativeBuildInputs = [ pkgs.lsof ]; } ''
+              sh ${./checks/disk-hygiene-test.sh} ${./deploy/nomad/disk-hygiene.sh} && touch $out
+            '';
         }
       );
 

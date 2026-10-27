@@ -74,6 +74,10 @@ notices.
 
 ## What you'll get
 
+The stack's disk thresholds, when the inventory's `monitoring.disk` doesn't
+set them: a warning at 85% used, high priority at 95% or under 20 GiB free
+(decision [0016](decisions/0016-disk-hygiene.md)).
+
 | Notice | When | Repeats |
 |---|---|---|
 | High priority | Docker engine not answering; an expected container missing, stopped or restarting; the console not answering; a service `failed`; a native service not running; a disk at `monitoring.disk.critPercent` or under `minFreeGiB` free, or not mounted | every 30 min |

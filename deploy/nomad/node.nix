@@ -21,6 +21,8 @@
 #       cpuMHz = 8000;          # cores x 1000 (Nomad can't read Apple Silicon's clock)
 #       feed = false;           # it hosts the live feed: background work there yields
 #       builds = false;         # host builds and tests of tinytrader may run there
+#       cleanRoots = [ ];       # where disk-hygiene deletes idle Rust target/ folders
+#                               # (relative to the home, or absolute; never /Volumes)
 #     };
 #   };
 #
@@ -32,6 +34,7 @@
 #   gate_calendar   the market calendar, from the host itself (the gate runs natively)
 #   gate_yield_to   name=url;... of the yieldTo services' health, on a feed host
 #   feed            "true" or "false"
+#   disk_hygiene_roots  cleanRoots, ":"-separated (empty: none)
 {
   site,
   host,
@@ -49,6 +52,7 @@ let
     pool = "default";
     feed = false;
     builds = false;
+    cleanRoots = [ ];
     memoryMB = null;
     cpuMHz = null;
   }
@@ -88,6 +92,7 @@ in
     inherit (node) memoryMB cpuMHz;
     meta = {
       feed = if node.feed then "true" else "false";
+      disk_hygiene_roots = builtins.concatStringsSep ":" node.cleanRoots;
       site_checkout = siteCheckout;
       docker_network = "${site.name}_default";
       # Research's reads of the console: by name on its host, else its
