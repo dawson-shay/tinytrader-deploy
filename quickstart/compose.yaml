@@ -1,5 +1,5 @@
 # tinytrader quickstart: a toy collector and the console, on one machine.
-#   docker compose up -d
+#   docker compose up -d            (CONSOLE_PORT=8081 docker compose up -d if 8080 is taken)
 #   open http://localhost:8080
 # Pulls the published images (ghcr.io/dawson-shay/tinytrader-<service>:main).
 # To build them from a tinytrader checkout instead, see README.md, "Images".
@@ -56,8 +56,11 @@ services:
     environment:
       CONTAINERS: 1
       POST: 0
+      LOG_LEVEL: warning   # not a line for every request the console polls
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # DOCKER_SOCKET: the engine's socket on this machine, if not the
+      # default (rootless Docker, Podman; README.md, "Notes").
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     <<: *service
     mem_limit: 64m
     cpus: 1.0

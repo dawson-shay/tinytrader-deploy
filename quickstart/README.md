@@ -12,8 +12,17 @@ docker compose up -d             # pulls the images; nothing to build
 open http://localhost:8080       # or visit it in any browser
 ```
 
+**If port 8080 is taken** (another console, a proxy, a dev server),
+`CONSOLE_PORT` moves the console: `CONSOLE_PORT=8081 docker compose up -d`,
+then use that port wherever this page says 8080.
+
 The first start downloads the images (about 15 MB each); later starts take
 seconds. To build the images yourself instead, see [Images](#images).
+
+On first start the console's log says that writes are refused and live
+orders are disabled, and names the login header and settings that would
+enable them. That is expected: the quick start configures no logins and no
+order token, so the console only shows state. Nothing needs setting.
 
 ## What runs
 
@@ -42,10 +51,12 @@ cargo run -p tinytrader-tui -- --console http://localhost:8080
 ```
 
 The images have no shell, so read the recorded data through a throwaway
-container:
+container that borrows the ticker's volume (whatever the project is called;
+run it in this directory):
 
 ```sh
-docker run --rm -v tinytrader-quickstart_ticker-data:/d alpine sh -c 'ls -lR /d; tail -n 2 /d/BTC-USD/*.jsonl'
+docker run --rm --volumes-from "$(docker compose ps -aq ticker)":ro alpine \
+  sh -c 'ls -lR /data; tail -n 2 /data/BTC-USD/*.jsonl'
 ```
 
 ## Images
@@ -67,9 +78,6 @@ repository:
 ```sh
 docker compose -f compose.yaml -f compose.build.yaml up -d --build
 ```
-
-`CONSOLE_PORT` moves the console from port 8080, for example when another
-console already uses it.
 
 ## Things to try
 
@@ -95,3 +103,15 @@ docker compose down -v       # stop and delete the recorded data
   [A network](../README.md#a-network) and [Your own site](../README.md#your-own-site).
 - Access to the Docker socket is equivalent to root on this machine, which is
   why the console only reaches it through the read-only proxy.
+- The proxy mounts the engine's socket from `/var/run/docker.sock`, where
+  Docker Desktop, Colima and a rootful Linux engine have it. Elsewhere, point
+  `DOCKER_HOST` (for the `docker` command) and `DOCKER_SOCKET` (for the
+  proxy's mount) at the engine's socket:
+
+  ```sh
+  # rootless Docker
+  export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock DOCKER_SOCKET=$XDG_RUNTIME_DIR/docker.sock
+  # rootless Podman (start its socket first: systemctl --user enable --now podman.socket)
+  export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock DOCKER_SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock
+  docker compose up -d
+  ```

@@ -18,11 +18,12 @@ prices and the tinytrader console. It needs only Docker with Compose: the
 images are published prebuilt, so there is nothing to install or build.
 
 ```sh
-cd quickstart && docker compose up -d
+cd quickstart && docker compose up -d     # port 8080 taken? CONSOLE_PORT=8081 docker compose up -d
 ```
 
-Then open <http://localhost:8080>. `curl -s http://localhost:8080/api/state`
-shows the same state from the command line. `docker compose down -v` removes
+Then open <http://localhost:8080> (or the port you chose).
+`curl -s http://localhost:8080/api/state` shows the same state from the
+command line. `docker compose down -v` removes
 it and its recorded data. To build the images from a tinytrader checkout
 instead, see [its README](quickstart/README.md#images).
 
@@ -31,16 +32,20 @@ instead, see [its README](quickstart/README.md#images).
 Several machines run one deployment as a site (below): its inventory says
 which machine runs what, and the machines reach each other over a tailnet.
 
-1. **Join each machine to the tailnet:** `scripts/tailscale-join TARGET`
-   (an ssh destination), after its first switch.
-2. **List them in your site's `inventory.nix`:** each host under `hosts`,
-   `nomad` placed on the hosts that run batch work, and the scheduler's
-   policy under `deployment.nomad` (the server, each node's pool and
-   budget). The [example inventory](example/inventory.nix) has every field.
-3. **Start the scheduler:** switch each machine to its role, then
-   `scripts/tailnet-serve --apply` on each, and `scripts/nomad-bootstrap` on
-   the server's host (ACLs, the token into the site's secrets, the jobs).
-4. **Run batch jobs:** `scripts/job run research-collector script=collect_x.py`,
+1. **List the machines in your site's `inventory.nix`:** each host under
+   `hosts`, `nomad` placed on the hosts that run batch work, and the
+   scheduler's policy under `deployment.nomad` (the server, each node's pool
+   and budget). The [example inventory](example/inventory.nix) has every
+   field.
+2. **Switch each machine** to its configuration, which imports its role
+   from the inventory. The first switch starts `tailscaled`, which the next
+   step needs.
+3. **Join each machine to the tailnet:** `scripts/tailscale-join TARGET`
+   (an ssh destination, before Tailscale its LAN address).
+4. **Start the scheduler:** `scripts/tailnet-serve --apply` on each machine,
+   then `scripts/nomad-bootstrap` on the server's host (ACLs, the token into
+   the site's secrets, the jobs).
+5. **Run batch jobs:** `scripts/job run research-collector script=collect_x.py`,
    `scripts/job list`, `scripts/job logs RUN`. The jobs are the site's
    `deploy/nomad/jobs/` ([example](example/deploy/nomad/jobs/)).
 
