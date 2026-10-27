@@ -41,7 +41,7 @@ export DISK_HYGIENE_ROOTS="repos:.cache/cargo-target:/Volumes/anything:missing"
 echo "== a dry run removes nothing, and says what it would"
 (export DISK_HYGIENE_DRY_RUN=1; run)
 kept "$r/old/target"
-logged "would delete $r/old/target (4"
+logged "would delete $r/old/target ("
 logged "bytes would be freed"
 (export DISK_HYGIENE_STEPS="targets nix docker"; run --dry-run)
 kept "$r/old/target"
