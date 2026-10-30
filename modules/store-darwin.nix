@@ -16,6 +16,7 @@
 #   alpaca-history = {
 #     keys = "accounts/my-account.env";   # the Alpaca account whose data limit it uses (APCA_API_KEY_ID, APCA_API_SECRET_KEY)
 #     yieldTo = [ "relay-a" ];            # the relays it waits for while they are live (their observe ports)
+#     topoff = [ "SPY" ];                 # symbols topped off from SIP every evening (optional; none: runs only when asked)
 #   };
 #   captureHours = "09:25-16:20";         # the hours it starts no day within 15 minutes of
 #
@@ -193,6 +194,11 @@ in
             historySettings.yieldTo or [ ]
           );
           HISTORY_CAPTURE_HOURS = deployment.captureHours or "09:25-16:20";
+        }
+        // lib.optionalAttrs ((historySettings.topoff or [ ]) != [ ]) {
+          # Symbols it tops off from SIP every evening, as on a NAS
+          # (modules/nas.nix historyTopoff).
+          HISTORY_TOPOFF = lib.concatStringsSep "," historySettings.topoff;
         };
       };
     })
