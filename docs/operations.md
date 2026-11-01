@@ -324,9 +324,14 @@ ls -l ~/.local/state/tinytrader-backup     # last-backup, last-offhost: when eac
   previous snapshot): the deploy checkouts where the host has them, else
   `BACKUP_REPOS` (`~/repos`). Work in progress in a working copy on a host
   with deploy checkouts is not in the snapshot: push it.
+- `paths/<path>/`: other state directories copied whole (`BACKUP_EXTRA_PATHS`;
+  databento-jobs' ledger on a Mac, `/var/lib/private/tinytrader` on the NAS),
+  unchanged files hard-linked to the previous snapshot, without the
+  subdirectories in `BACKUP_EXTRA_SKIP` (databento-jobs' download `cache/`:
+  staging for the store, refetched from Databento rather than backed up).
 - `MANIFEST.json` (each volume, each gateway's last `seq`) and `SHA256SUMS`.
 
-Not in it: market data (the store's drives), and **no key of any kind**.
+Not in it: market data (the store's drives, or a download cache), and **no key of any kind**.
 Secrets are recovered with the operator key (on the machines you sit at and
 in your password manager) or the recovery key (the inventory's
 `secrets.recovery`, its private half kept offline); see

@@ -272,9 +272,14 @@ in
         StandardErrorPath = lib.mkForce "${logs}/${lib.removePrefix "tinytrader-" label}.log";
       };
     }))
-    # The ledger in the nightly backup.
+    # The ledger in the nightly backup, without the download cache (staging
+    # for the store, refetchable while Databento keeps the job, and too big to
+    # copy nightly onto the same disk).
     (lib.mkIf config.tinytrader-deploy.backup.enable {
-      tinytrader-backup.serviceConfig.EnvironmentVariables.BACKUP_EXTRA_PATHS = jobsState;
+      tinytrader-backup.serviceConfig.EnvironmentVariables = {
+        BACKUP_EXTRA_PATHS = jobsState;
+        BACKUP_EXTRA_SKIP = "cache";
+      };
     })
   ];
 

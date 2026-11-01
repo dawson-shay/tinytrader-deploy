@@ -114,6 +114,7 @@ stack="${TINYTRADER_DEPLOY:-$repos/tinytrader-deploy}"
 gw="${BACKUP_GATEWAY_STATE:-$HOME/.local/state/order-gateway}"
 docker_on="${BACKUP_DOCKER:-1}"         # 0 on a host with no Docker engine (the NAS)
 extra_paths="${BACKUP_EXTRA_PATHS:-}"   # more directories to copy whole (the NAS's /var/lib/tinytrader)
+extra_skip="${BACKUP_EXTRA_SKIP:-}"     # subdirectories of those not to copy (databento-jobs' download cache)
 keep_daily="${BACKUP_KEEP_DAILY:-14}"
 keep_weekly="${BACKUP_KEEP_WEEKLY:-8}"
 min_free_gib="${BACKUP_MIN_FREE_GIB:-10}"
@@ -304,13 +305,18 @@ copy_repos() { # DEST PREVIOUS
   done
 }
 
-copy_extra() { # DEST
-  local d="$1" p
+copy_extra() { # DEST PREV
+  local d="$1" prev="$2" p name x skip=() link
+  # Staging data that is re-fetched, not kept (a download cache), stays out:
+  # a nightly copy of it on the same disk protects nothing and fills the disk.
+  for x in $extra_skip; do skip+=(--exclude "/$x/"); done
   for p in $extra_paths; do
     if [ ! -d "$p" ]; then log "no $p"; continue; fi
-    if [ "$dry" = 1 ]; then would "copy $p"; continue; fi
+    if [ "$dry" = 1 ]; then would "copy $p${extra_skip:+ (not ${extra_skip})}"; continue; fi
     mkdir -p "$d/paths"
-    rsync -a "$p/" "$d/paths/$(tr / _ <<<"${p#/}")/"
+    name="$(tr / _ <<<"${p#/}")" link=()
+    [ -n "$prev" ] && [ -d "$prev/paths/$name" ] && link=(--link-dest="$prev/paths/$name")
+    rsync -a "${skip[@]}" "${link[@]}" "$p/" "$d/paths/$name/"
     log "copied $p"
   done
 }
@@ -349,7 +355,7 @@ snapshot() {
   fi
   copy_gateways "$d" "$prev"
   copy_repos "$d" "$prev"
-  copy_extra "$d"
+  copy_extra "$d" "$prev"
   [ "$dry" = 0 ] || return 0
   jq -n --arg host "$host" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg site "$(git -C "$site" rev-parse HEAD 2>/dev/null || echo unknown)" \
