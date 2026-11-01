@@ -435,7 +435,12 @@ send_offhost() {
   out="$root/.outbox"
   rm -rf "$out"; mkdir -m 700 "$out"
   file="$out/$name.tar.zst.age"
-  tar -C "$root" -cf - "$name" | zstd -q -T0 -10 | age "${rargs[@]}" > "$file.tmp"
+  # A failed copy (a full disk, say) leaves nothing behind: the outbox holds a
+  # whole snapshot's worth.
+  if ! tar -C "$root" -cf - "$name" | zstd -q -T0 -10 | age "${rargs[@]}" > "$file.tmp"; then
+    rm -rf "$out"
+    die "encrypting $name for $offhost failed"
+  fi
   mv "$file.tmp" "$file"
   mkdir -p "$state"
   # Only what is sent and kept there: the receiver's forced command (rrsync,
