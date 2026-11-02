@@ -529,7 +529,10 @@ or the same service elsewhere), and databento-jobs while it has no ledger
 made without the record of the earlier ones; both say so in their log and
 try again a minute later. A relay's symbols and whether it starts are the
 inventory's `deployment.native.<relay>` (`symbols`, `enable`), its hours
-`deployment.captureHours`. Data for research is bought in the console's Data
+`deployment.captureHours`. A relay's replay files (tinytrader's `POST
+/replay`, made only when asked for) go to
+`/var/lib/tinytrader/relay-replay/<relay>/<date>/`, readable by every local
+user; `replay = false` in its `deployment.native.<relay>` turns them off. Data for research is bought in the console's Data
 section; `tt.databento()` stops with "purchases go through databento-jobs".
 
 **Moving them from containers to the daemons** (once, after a close; the
