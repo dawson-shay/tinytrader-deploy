@@ -235,7 +235,12 @@
         keys = "accounts/paper.env";
         yieldTo = [ "relay-opra-spy" ];
       };
-      relay-opra-spy.symbols = "SPY.OPT";
+      relay-opra-spy = {
+        symbols = "SPY.OPT";
+        # Replay files on request (tinytrader's POST /replay), under
+        # /var/lib/tinytrader/relay-replay/relay-opra-spy; on by default.
+        replay = true;
+      };
       queue-host-runner.enable = false;
       runner.url = "https://github.com/your-name/my-site";
     };

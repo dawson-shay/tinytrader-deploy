@@ -32,6 +32,11 @@
 #   (copied from wherever it ran before: docs/operations.md, The Databento key).
 #   It won't start without one, so no purchase is ever made without the
 #   ledger of the earlier ones. The nightly backup copies the directory.
+# - A relay's replay files (tinytrader's `POST /replay`, written only on
+#   request): /var/lib/tinytrader/relay-replay/<relay>, _ttdata's, mode 0755
+#   so other local users can read them; not in the nightly backup (Databento
+#   replays them for 24 hours, and history comes from the store). On unless
+#   deployment.native.<relay>.replay = false.
 # - Never two Databento sessions on one stream: each refuses to start while
 #   something already listens on its ports (the container it replaces), and
 #   tries again a minute later.
@@ -59,6 +64,7 @@ let
   logs = "/Library/Logs/tinytrader-data";
   stateRoot = "/var/lib/tinytrader";
   jobsState = "${stateRoot}/databento-jobs";
+  replayRoot = "${stateRoot}/relay-replay";
   ledger = "${jobsState}/submissions.jsonl";
   q = lib.escapeShellArg;
   secret = name: config.sops.secrets.${name}.path;
@@ -117,6 +123,8 @@ let
     name: _:
     {
       enable = true;
+      # Replay files on request, under replayRoot.
+      replay = true;
     }
     // (deployment.native.${name} or { })
   ) (lib.filterAttrs (name: _: lib.hasPrefix "relay-" name) placedHere);
@@ -154,6 +162,9 @@ let
         RELAY_OBSERVE_LISTEN = "127.0.0.1:${toString p.observe}";
         RELAY_HOURS = optionsHours;
         RELAY_CALENDAR = "${url "accounts" "http"}/calendar";
+      }
+      // lib.optionalAttrs r.replay {
+        RELAY_REPLAY_DIR = "${replayRoot}/${name}";
       };
     };
 
@@ -215,6 +226,7 @@ let
     databento-jobs = jobs;
   };
   enabled = lib.attrNames (lib.filterAttrs (_: s: s.enable) services);
+  replaying = lib.attrNames (lib.filterAttrs (_: r: r.enable && r.replay) relays);
   owned = {
     owner = user;
     group = user;
@@ -289,7 +301,8 @@ in
   }) enabled;
 
   # Before launchd loads the daemons (the users exist by then): the log
-  # directory and files, and the ledger's directory.
+  # directory and files, the ledger's directory, and the relays' replay
+  # directories.
   system.activationScripts.launchd.text = lib.mkOrder 750 ''
     install -d -m 755 -o root -g wheel ${q logs}
     ${lib.concatMapStrings (n: ''
@@ -299,7 +312,11 @@ in
     '') enabled}
     install -d -m 755 -o root -g wheel ${q stateRoot}
     install -d -m 755 -o ${user} -g ${user} ${q jobsState}
-  '';
+    ${lib.optionalString (replaying != [ ]) ''
+      install -d -m 755 -o root -g wheel ${q replayRoot}
+    ''}${lib.concatMapStrings (n: ''
+      install -d -m 755 -o ${user} -g ${user} ${q "${replayRoot}/${n}"}
+    '') replaying}  '';
 
   environment.etc."newsyslog.d/tinytrader-data.conf".text = ''
     # logfile                       owner:group          mode count size(KB) when flags

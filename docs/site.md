@@ -50,7 +50,7 @@ a comment on every field. In brief:
   - `native.<service>`: the native services' settings: `store` (`volumes`
     as `{ name; root; }` data roots in order, `discover`, `args`),
     `alpaca-history` (`keys`, `yieldTo`), each `relay-*` (`symbols`,
-    `enable`), `queue-host-runner` (`enable`, `path`), `runner` (`url`,
+    `enable`, `replay`: replay files on request, default on), `queue-host-runner` (`enable`, `path`), `runner` (`url`,
     `name`, `attr`).
   - `hosts.<host>.siteCheckout`: the site checkout batch jobs mount on a
     host without deploy checkouts (relative to the primary user's home, or
