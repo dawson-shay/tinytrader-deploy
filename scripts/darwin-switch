@@ -2,8 +2,9 @@
 # Apply this Mac's nix-darwin configuration from the site's flake: its
 # darwinConfigurations entry named for this Mac's LocalHostName, for a Mac
 # whose whole machine configuration the site carries (most Macs take their
-# role from a machines repository instead; docs/site.md). Asks for your
-# password (activation runs as root). The site is scripts/lib/site.sh's.
+# role from a machines repository instead; docs/site.md). Builds as you,
+# then asks for your password to activate it (that runs as root). The site
+# is scripts/lib/site.sh's.
 #
 # It builds tinytrader at the revision the site's flake.lock pins, so what
 # runs is what's committed. To try a local checkout instead (development):
@@ -43,10 +44,17 @@ if [ "$has" != true ]; then
   exit 1
 fi
 
-if command -v darwin-rebuild >/dev/null; then
-  rebuild=(darwin-rebuild)
-else
-  # First time: nix-darwin isn't installed yet.
-  rebuild=(nix run "github:nix-darwin/nix-darwin/nix-darwin-26.05#darwin-rebuild" --)
+if [ ! -e /run/current-system ]; then
+  # First time: nix-darwin isn't installed yet; its own installer does it.
+  sudo nix run "github:nix-darwin/nix-darwin/nix-darwin-26.05#darwin-rebuild" -- \
+    switch --flake "$site#$host" ${override[@]+"${override[@]}"}
+  exit
 fi
-sudo "${rebuild[@]}" switch --flake "$site#$host" ${override[@]+"${override[@]}"}
+
+# Built as you, so the flake's inputs are fetched with your access (private
+# repositories need your git credentials, which root doesn't have); only
+# activating it runs as root, as darwin-rebuild switch does after building.
+system="$(nix build --no-link --print-out-paths "$site#darwinConfigurations.$host.system" ${override[@]+"${override[@]}"})"
+echo "activating $system"
+sudo -H "$(command -v nix-env)" -p /nix/var/nix/profiles/system --set "$system"
+sudo -H "$system/activate"
