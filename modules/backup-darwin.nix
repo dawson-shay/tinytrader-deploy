@@ -73,7 +73,8 @@ in
     (mkIf cfg.enable {
       launchd.daemons.tinytrader-backup.serviceConfig = {
         Label = "com.tinytrader.backup";
-        ProgramArguments = [
+        # Once the Nix store is mounted (modules/launchd-wait.nix).
+        ProgramArguments = import ./launchd-wait.nix [
           (lib.getExe b.package)
           "--scheduled"
         ];
