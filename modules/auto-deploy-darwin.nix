@@ -57,7 +57,8 @@ in
   config = mkIf cfg.enable {
     launchd.user.agents.tinytrader-auto-deploy.serviceConfig = {
       Label = "com.tinytrader.auto-deploy";
-      ProgramArguments = [
+      # Once the Nix store is mounted (modules/launchd-wait.nix).
+      ProgramArguments = import ./launchd-wait.nix [
         (lib.getExe pkgs.bash)
         "${checkouts.stack}/scripts/auto-deploy"
         "--scheduled"

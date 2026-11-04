@@ -36,7 +36,8 @@ in
 
     launchd.daemons.nomad.serviceConfig = {
       UserName = user;
-      ProgramArguments = [
+      # Once the Nix store is mounted (modules/launchd-wait.nix).
+      ProgramArguments = import ./launchd-wait.nix [
         (lib.getExe cfg.package)
         "agent"
         "-config"

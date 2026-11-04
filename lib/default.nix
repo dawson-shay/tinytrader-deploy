@@ -146,7 +146,12 @@ in
       };
 
       forAllSystems = lib.genAttrs systems;
-      backupFor = pkgs: import ../modules/backup.nix { inherit pkgs site; inherit (pkgs) lib; };
+      backupFor =
+        pkgs:
+        import ../modules/backup.nix {
+          inherit pkgs site;
+          inherit (pkgs) lib;
+        };
 
       packages = forAllSystems (
         system:
@@ -226,11 +231,11 @@ in
           nomad =
             c:
             lib.optionalAttrs (c.tinytrader-deploy ? nomad) {
-            nomad = {
-              inherit (c.tinytrader-deploy.nomad) enable;
-              observe.port = c.tinytrader-deploy.nomad.ports.http;
+              nomad = {
+                inherit (c.tinytrader-deploy.nomad) enable;
+                observe.port = c.tinytrader-deploy.nomad.ports.http;
+              };
             };
-          };
           runnerAttr = (inv.deployment.native.runner or { }).attr or name;
           roles =
             lib.mapAttrs (
@@ -283,15 +288,72 @@ in
           # compose.yaml's project is the deployment's name (inventory.nix
           # deployment.name): the monitor, the backup and scripts/deploy
           # find the containers by it.
-          compose-name =
-            pkgs.runCommand "compose-name" { nativeBuildInputs = [ pkgs.yq-go ]; } ''
-              got="$(yq -r '.name // ""' ${compose})"
-              if [ "$got" != ${lib.escapeShellArg name} ]; then
-                echo "compose-name: compose.yaml's name is '$got', the inventory's deployment.name '${name}': make them the same" >&2
-                exit 1
-              fi
-              touch $out
-            '';
+          compose-name = pkgs.runCommand "compose-name" { nativeBuildInputs = [ pkgs.yq-go ]; } ''
+            got="$(yq -r '.name // ""' ${compose})"
+            if [ "$got" != ${lib.escapeShellArg name} ]; then
+              echo "compose-name: compose.yaml's name is '$got', the inventory's deployment.name '${name}': make them the same" >&2
+              exit 1
+            fi
+            touch $out
+          '';
+          # Every launchd job on every Mac starts only once the Nix store is
+          # mounted: through /bin/wait4path (modules/launchd-wait.nix,
+          # tinytrader's lib.launchd.waitForNix, or nix-darwin's own `command`
+          # and `script`, which wrap it the same way). One that doesn't fails
+          # at boot and is never retried (EX_CONFIG, 2026-11-01).
+          launchd-wait4path =
+            let
+              # Only the wrapper's first three arguments are read: the program
+              # itself may name a site's secret files, which the example sites
+              # don't have.
+              waits =
+                args:
+                lib.elemAt args 0 == "/bin/sh"
+                && lib.elemAt args 1 == "-c"
+                && lib.hasPrefix "/bin/wait4path /nix/store && exec " (lib.elemAt args 2);
+              jobsOf =
+                host: example:
+                let
+                  c =
+                    (example.extendModules {
+                      modules = [
+                        {
+                          tinytrader-deploy.autoDeploy.enable = true;
+                        }
+                      ];
+                    }).config;
+                  all =
+                    lib.mapAttrsToList (n: j: {
+                      name = "${host} daemon ${n}";
+                      job = j;
+                    }) c.launchd.daemons
+                    ++ lib.mapAttrsToList (n: j: {
+                      name = "${host} agent ${n}";
+                      job = j;
+                    }) c.launchd.user.agents;
+                in
+                # The jobs these modules define with their own ProgramArguments.
+                # tinytrader.services' jobs are tinytrader's, checked there
+                # (its checks.darwin-services); third-party ones such as
+                # sops-nix's use nix-darwin's `command`, which waits the same way.
+                lib.filter (
+                  j:
+                  lib.any (l: lib.hasSuffix l j.name) [
+                    " agent tinytrader-auto-deploy"
+                    " daemon tinytrader-backup"
+                    " daemon nomad"
+                  ]
+                ) all;
+              jobs = lib.concatLists (lib.mapAttrsToList jobsOf examples.darwin);
+              bad = lib.filter (j: !(waits j.job.serviceConfig.ProgramArguments)) jobs;
+            in
+            assert lib.assertMsg (lib.length jobs >= 3)
+              "launchd-wait4path: expected the auto-deploy, backup and nomad jobs, found ${toString (lib.length jobs)}";
+            assert lib.assertMsg (bad == [ ])
+              "launchd-wait4path: these start before /nix may be mounted: ${
+                lib.concatMapStringsSep ", " (j: j.name) bad
+              }";
+            pkgs.runCommand "launchd-wait4path" { } "touch $out";
           # Each Mac's auto-deploy agent is off unless asked for, and when on
           # runs scripts/auto-deploy from the stack's deploy checkout, never a
           # working copy (modules/auto-deploy-darwin.nix, docs/decisions/0012);
