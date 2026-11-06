@@ -37,7 +37,10 @@ grep -qF "$want" "$file" || { echo "databento-key: this Mac's host key ($want) i
 
 # sops as root with the host key only (no operator key, no root's own).
 as_root() {
-  sudo -H env SOPS_AGE_SSH_PRIVATE_KEY_FILE="$host_key" SOPS_AGE_KEY_FILE=/dev/null \
+  # The host key reaches sops as an age identity from a command run by root
+  # (sops 3.13 doesn't read SOPS_AGE_SSH_PRIVATE_KEY_FILE); it never leaves
+  # that process, and no file holds it.
+  sudo -H env SOPS_AGE_KEY_CMD="$(command -v ssh-to-age) -private-key -i $host_key" SOPS_AGE_KEY_FILE=/dev/null \
     EDITOR="${EDITOR:-vi}" "$(command -v sops)" "$@"
 }
 mine() { sudo chown "$(id -u):$(id -g)" "$file"; }
