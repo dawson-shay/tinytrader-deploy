@@ -7,8 +7,22 @@
 #   imports = [ inputs.my-site.nixosModules.nas ];
 #   tinytrader-deploy.nas = {
 #     enable = true;
-#     volumes = { tank = "/tank/market"; };   # the store's drives: name → path
+#     # The store's drives: name → { path; id; }, a mounted filesystem each
+#     # (a ZFS dataset, say), whose id file holds `id`.
+#     volumes.tank = { path = "/tank/market"; id = "tank-2026-01-01-1a2b3c4d"; };
 #   };
+#
+# Each service runs here when the placement map puts it here (inventory.nix
+# `services`). While the host is still `planned`, everything is enabled, so
+# the module is evaluated and checked ahead of the hardware.
+#
+# The store (tinytrader decision 0039, "Where it runs"): the only writer of
+# its volumes, as a system user of its own (not a transient one: the files it
+# writes outlive the unit); it needs every volume's filesystem mounted
+# (RequiresMountsFor) and refuses to start unless each volume's id file
+# (`idFile`, at its root) holds the id given here. A missing or swapped disk
+# leaves the store stopped, never writing to the empty directory under a
+# mount point or to the wrong disk.
 #
 # Secrets are decrypted at boot by sops-nix with the host's SSH host key (add
 # its age recipient to the inventory and run scripts/secrets-recipients
@@ -21,7 +35,9 @@
 # tinytrader's module, tinytrader.topology.nodeExporter). Written ahead of
 # the placement map: still in compose.yaml, to move next, are the relays,
 # accounts, alpaca-data, alpaca-news, econ-calendar, the order gateways and
-# the queue.
+# the queue. A recorder placeholder (tinytrader decision 0040), off, where the
+# site places `recorders`; the store's maintenance timers
+# (modules/nas-maintenance.nix); auto-deploy (modules/auto-deploy-nixos.nix).
 {
   tinytrader,
   sops-nix,
@@ -43,6 +59,52 @@ let
     ;
   cfg = config.tinytrader-deploy.nas;
   inherit (site) inventory;
+  # Whether the placement map runs a service here. A planned host runs
+  # everything its role declares (written ahead, as checks/placement.nix
+  # allows); once it exists, only what is placed on it.
+  planned = (inventory.hosts.${host}.status or "") == "planned";
+  placedHere =
+    name:
+    let
+      s = inventory.services.${name} or { };
+    in
+    (s.host or null) == host || (s.perHost or { }) ? ${host};
+  here = name: planned || placedHere name;
+  volumePaths = lib.mapAttrsToList (_: v: v.path) cfg.volumes;
+  storeUser = "tinytrader-store";
+  # Before the store starts: each volume's path is a mount point and its id
+  # file holds the id the machine's configuration expects (decision 0039).
+  volumeCheck = pkgs.writeShellScript "tinytrader-store-volumes" ''
+    set -u
+    bad=0
+    check() {
+      name="$1" path="$2" want="$3"
+      if ! ${pkgs.util-linux}/bin/mountpoint -q "$path"; then
+        echo "store: volume $name: $path is not a mounted filesystem; refusing to start" >&2
+        bad=1
+        return
+      fi
+      if [ ! -r "$path/${cfg.idFile}" ]; then
+        echo "store: volume $name: no readable $path/${cfg.idFile}; refusing to start" >&2
+        bad=1
+        return
+      fi
+      got="$(${pkgs.coreutils}/bin/head -c 256 "$path/${cfg.idFile}" | ${pkgs.coreutils}/bin/tr -d '[:space:]')"
+      if [ "$got" != "$want" ]; then
+        echo "store: volume $name: $path/${cfg.idFile} says '$got', expected '$want' (the wrong disk?); refusing to start" >&2
+        bad=1
+        return
+      fi
+      echo "store: volume $name: $path is $want"
+    }
+    ${lib.concatStrings (
+      lib.mapAttrsToList (
+        name: v: "check ${lib.escapeShellArgs [ name v.path v.id ]}
+"
+      ) cfg.volumes
+    )}
+    exit "$bad"
+  '';
   historyKeys =
     inventory.deployment.native.alpaca-history.keys
       or (throw "modules/nas.nix: the inventory's deployment.native.alpaca-history.keys (its Alpaca account's secrets file) is unset");
@@ -55,18 +117,32 @@ let
     native = lib.attrNames (
       lib.filterAttrs (name: s: name != "watch" && s.enable) config.tinytrader.services
     );
-    extraDisks = lib.attrValues cfg.volumes;
+    extraDisks = volumePaths;
   };
   # Notices only once secrets/notify.env exists (and holds HC_PING_NAS):
   # until then the monitor logs what it would send.
   notify = watch.notifyFile != null;
   # Where this host's services reach the others (deploy/local/endpoints.nix,
   # docs/decisions/0008): wherever inventory.nix places them.
-  url = to: "http://${site.endpoints.address {
-    from = host;
-    runtime = "systemd";
-    inherit to;
-  }}";
+  urlOf =
+    to: port:
+    "http://${site.endpoints.address {
+      from = host;
+      runtime = "systemd";
+      inherit to port;
+    }}";
+  url = to: urlOf to null;
+  # Background work yields to live capture (tinytrader decisions 0011,
+  # 0033): the relays a service `uses` by their observe port, wherever they
+  # run (the services' host, over the tailnet), and capture's hours.
+  captureHours = inventory.deployment.captureHours or "09:25-16:20";
+  relaysUsedBy =
+    name:
+    lib.filter (r: lib.hasPrefix "relay-" r) (
+      map (u: lib.head (lib.splitString ":" u)) ((inventory.services.${name} or { }).uses or [ ])
+    );
+  yieldTo = relays: lib.concatMapStringsSep ";" (r: "${r}=${urlOf r "observe"}") relays;
+  uses = name: other: lib.any (u: lib.head (lib.splitString ":" u) == other) ((inventory.services.${name} or { }).uses or [ ]);
   # The store's write token, once secrets/store.env exists (decision 0008):
   # the store requires it, and its writers send it.
   # The nightly backup (modules/backup.nix): its package and settings.
@@ -84,18 +160,54 @@ in
     # `nomad` on this host. The machine must allow the unfree nomad package
     # by name.
     ./nomad-nixos.nix
+    # The store's scheduled maintenance (tt-fsck, the integrity sweep, the
+    # cold copies, backfills): systemd timers, off until their binaries exist.
+    ./nas-maintenance.nix
+    # Deploying what merges to main (docs/decisions/0011), off unless asked.
+    ./auto-deploy-nixos.nix
   ];
 
   options.tinytrader-deploy.nas = {
     enable = mkEnableOption "this deployment's services on the NAS";
     volumes = mkOption {
-      type = types.attrsOf types.str;
+      type = types.attrsOf (
+        types.submodule {
+          options = {
+            path = mkOption {
+              type = types.str;
+              description = "Where the volume is mounted (a ZFS dataset's mountpoint, say).";
+            };
+            id = mkOption {
+              type = types.strMatching "[A-Za-z0-9._-]+";
+              description = ''
+                The volume's identity: what its id file (`idFile`, at the
+                volume's root) must hold, or the store refuses to start
+                (tinytrader decision 0039). Written once, when the volume is
+                made; never reused for another disk.
+              '';
+            };
+          };
+        }
+      );
       example = {
-        tank = "/tank/market";
+        tank = {
+          path = "/tank/market";
+          id = "tank-2026-01-01-1a2b3c4d";
+        };
       };
       description = ''
-        The store's volumes, name → path (a ZFS dataset's mountpoint). The
-        store is the only service that writes them (tinytrader decision 0005).
+        The store's volumes, name → { path, id }. The store is the only
+        service that writes them (tinytrader decisions 0005, 0039: one writer
+        per volume).
+      '';
+    };
+    idFile = mkOption {
+      type = types.str;
+      default = ".tinytrader-volume-id";
+      description = ''
+        The id file at each volume's root, checked before the store starts.
+        Until the store keeps one itself (decision 0039), it is written by
+        hand when the volume is made.
       '';
     };
     historyTopoff = mkOption {
@@ -107,6 +219,45 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !config.tinytrader.services.store.enable || cfg.volumes != { };
+        message = "tinytrader-deploy.nas: the store runs here, but nas.volumes is empty";
+      }
+      {
+        assertion =
+          let
+            ids = lib.mapAttrsToList (_: v: v.id) cfg.volumes;
+          in
+          lib.length ids == lib.length (lib.unique ids);
+        message = "tinytrader-deploy.nas.volumes: two volumes have the same id";
+      }
+    ];
+
+    # The deploy checkouts are named as on a Mac: <deployRoot>/<deployment>.
+    tinytrader-deploy.checkouts.site = lib.mkDefault "${config.tinytrader-deploy.deployRoot}/${site.name}";
+
+    # The store's own system user: it owns what it writes on the volumes,
+    # across restarts and rebuilds (a DynamicUser's uid may change).
+    users.users.${storeUser} = mkIf config.tinytrader.services.store.enable {
+      isSystemUser = true;
+      group = storeUser;
+      description = "tinytrader store (the only writer of the store's volumes)";
+    };
+    users.groups.${storeUser} = mkIf config.tinytrader.services.store.enable { };
+
+    systemd.services.tinytrader-store = mkIf config.tinytrader.services.store.enable {
+      # Each volume mounted first; if one isn't (a pool not imported, a disk
+      # gone), the store doesn't start.
+      unitConfig.RequiresMountsFor = volumePaths;
+      serviceConfig = {
+        DynamicUser = lib.mkForce false;
+        User = storeUser;
+        Group = storeUser;
+        ExecStartPre = [ "${volumeCheck}" ];
+      };
+    };
+
     # A client of the batch scheduler (deploy/nomad/node.nix). Research
     # jobs mount research/ from a checkout of the site here:
     # deployment.hosts.<host>.siteCheckout (default /srv/<deployment.name>).
@@ -213,19 +364,23 @@ in
     tinytrader.services = {
       # The data store: the only process that touches the data disks.
       store = {
-        enable = true;
+        enable = here "store";
         package = packages.store;
         observe.port = 9120;
-        environment.STORE_VOLUMES = lib.concatStringsSep ";" (
-          lib.mapAttrsToList (name: path: "${name}=${path}") cfg.volumes
-        );
-        writablePaths = lib.attrValues cfg.volumes;
+        environment = {
+          STORE_VOLUMES = lib.concatStringsSep ";" (
+            lib.mapAttrsToList (name: v: "${name}=${v.path}") cfg.volumes
+          );
+          # Its record of every volume it has used (the default is a Mac's).
+          STORE_STATE = "${state "store"}/store-state.json";
+        };
+        writablePaths = volumePaths;
         secrets = withStoreToken "STORE_WRITE_TOKEN";
       };
 
       # The console, reading the services this host declares.
       console = {
-        enable = true;
+        enable = here "console";
         package = packages.console;
         observe.port = 8080;
         environment = {
@@ -242,12 +397,18 @@ in
       };
 
       databento-jobs = {
-        enable = true;
+        enable = here "databento-jobs";
         package = packages.databento-jobs;
         observe.port = 9121;
         environment = {
           JOBS_STORE = url "store";
           JOBS_LEDGER = "${state "databento-jobs"}/ledger.jsonl";
+          JOBS_YIELD_TO = yieldTo (relaysUsedBy "databento-jobs");
+          JOBS_CAPTURE_HOURS = captureHours;
+        }
+        // lib.optionalAttrs (uses "databento-jobs" "accounts") {
+          # The market calendar (holidays, early closes).
+          JOBS_CALENDAR = "${urlOf "accounts" "http"}/calendar";
         };
         secrets = {
           DATABENTO_API_KEY = secret "databento-api-key";
@@ -258,13 +419,15 @@ in
       };
 
       alpaca-history = {
-        enable = true;
+        enable = here "alpaca-history";
         package = packages.alpaca-history;
         observe.port = 9124;
         environment = {
           HISTORY_STORE = url "store";
           HISTORY_STATE = state "alpaca-history";
           HISTORY_TOPOFF = lib.concatStringsSep "," cfg.historyTopoff;
+          HISTORY_YIELD_TO = yieldTo ((inventory.deployment.native.alpaca-history or { }).yieldTo or [ ]);
+          HISTORY_CAPTURE_HOURS = captureHours;
         };
         secrets = {
           ALPACA_HISTORY_KEY_ID = secret "history-key-id";
@@ -273,11 +436,35 @@ in
         // withStoreToken "HISTORY_STORE_TOKEN";
       };
 
+    }
+    # Live capture recorders (tinytrader decision 0040): a placeholder, off,
+    # until tinytrader has the recorder binary (0040's steps, after 0035's
+    # core). Declared where the site places `recorders`, so the placement map
+    # and this role agree; it reads the streams it `uses` (the relays, over
+    # the tailnet) and will seal its chunks into the store. Enabling it means
+    # setting a real package here, not just enable = true.
+    // lib.optionalAttrs (inventory.services ? recorders) {
+      recorders = {
+        enable = false;
+        package = pkgs.writeShellScriptBin "recorders" ''
+          echo "recorders: not built yet (tinytrader decision 0040)" >&2
+          exit 1
+        '';
+        environment = {
+          RECORDER_STORE = url "store";
+          RECORDER_SOURCES = lib.concatMapStringsSep ";" (r: "${r}=${urlOf r "stream"}") (
+            relaysUsedBy "recorders"
+          );
+        };
+        secrets = withStoreToken "RECORDER_STORE_TOKEN";
+      };
+    }
+    // {
       # The host's monitor (tinytrader's watch): the services above, the
       # console's and the store's health, the disks, and the backup's age.
       # No Docker here.
       watch = {
-        enable = true;
+        enable = here "watch";
         package = packages.watch;
         environment = watch.environment // {
           WATCH_FRESH = backupHere.fresh backupState;

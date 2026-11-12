@@ -87,7 +87,15 @@ runner where `runner` runs, the backup where `backup` runs, the store and
 the Databento key's holders where they are placed natively
 ([roles/darwin.nix](../roles/darwin.nix)). Options: `tinytrader-deploy.deployRoot`,
 `.checkouts.{site,stack,tinytrader}`, `.autoDeploy.{enable,interval}`,
-`.backup.{enable,receive}`, and on NixOS `.nas.{enable,volumes,historyTopoff}`.
+`.backup.{enable,receive}`, and on NixOS `.autoDeploy.user` and
+`.nas.{enable,volumes,idFile,historyTopoff,maintenance}`
+([modules/nas.nix](../modules/nas.nix),
+[modules/nas-maintenance.nix](../modules/nas-maintenance.nix)). A NixOS
+role runs what the placement map puts on its host; while the host's `status`
+is `planned`, it runs everything it declares, so it is evaluated ahead of
+the hardware. Each NAS volume is `{ path; id; }`: the store starts only when
+every volume is mounted and its id file (`.tinytrader-volume-id` at its
+root) holds that id.
 
 ## Checkouts
 

@@ -131,7 +131,10 @@ in
                 nixpkgs.config.allowUnfreePredicate = pkg: lib.getName pkg == "nomad";
                 tinytrader-deploy.nas = {
                   enable = true;
-                  volumes.tank = "/tank/market";
+                  volumes.tank = {
+                    path = "/tank/market";
+                    id = "tank-example";
+                  };
                 };
                 boot.loader.grub.enable = false;
                 fileSystems."/" = {
