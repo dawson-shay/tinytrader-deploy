@@ -212,7 +212,9 @@ in
     };
     historyTopoff = mkOption {
       type = types.listOf types.str;
-      default = [ ];
+      # The site's (inventory.nix deployment.native.alpaca-history.topoff),
+      # as on a Mac.
+      default = (inventory.deployment.native.alpaca-history or { }).topoff or [ ];
       example = [ "SPY" ];
       description = "Symbols alpaca-history tops off nightly from SIP (none: runs only when asked).";
     };
@@ -275,7 +277,7 @@ in
     # Written ahead, like the rest of this role: the placement map runs
     # `backup` on the services' host, which isn't the NAS yet. Its off-host
     # copy starts once inventory.nix backup.offHost and keys name the NAS.
-    systemd.services.tinytrader-backup = {
+    systemd.services.tinytrader-backup = mkIf (here "backup") {
       description = "tinytrader state backup (scripts/backup-state)";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -305,7 +307,7 @@ in
         PrivateTmp = true;
       };
     };
-    systemd.timers.tinytrader-backup = {
+    systemd.timers.tinytrader-backup = mkIf (here "backup") {
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnCalendar = "*-*-* ${
@@ -314,7 +316,7 @@ in
         Persistent = true;
       };
     };
-    systemd.tmpfiles.rules = [ "d /var/backup/tinytrader 0700 root root -" ];
+    systemd.tmpfiles.rules = lib.optional (here "backup") "d /var/backup/tinytrader 0700 root root -";
 
     # Decrypted with the NAS's own SSH host key; nothing to copy onto it.
     sops.age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
