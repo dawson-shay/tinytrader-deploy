@@ -145,11 +145,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1792778746,
-        "narHash": "sha256-jcbhUMeIQsPvLyfXDiR89nx9GR/l0w8u29AMie2XR3Q=",
+        "lastModified": 1794525490,
+        "narHash": "sha256-b8Hkrwct5BIquOQw7uTaN1LgQA85YuQw/Aq63oSSjP0=",
         "ref": "main",
-        "rev": "cbd01d0817ff230d63bedfe1325b91a9d4416071",
-        "revCount": 434,
+        "rev": "bb4abd716edd34906671398f81bac689eae27f02",
+        "revCount": 528,
         "type": "git",
         "url": "https://github.com/dawson-shay/tinytrader"
       },

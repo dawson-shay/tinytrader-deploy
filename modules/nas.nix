@@ -261,6 +261,26 @@ in
   };
 
   config = mkIf cfg.enable {
+    # The storage tools an operator runs by hand (tinytrader decisions 0035
+    # and 0039): the store (its `migrate-cas`), `tt-fsck`, and the migration
+    # rehearsal, run on fake drives before any real one is migrated.
+    environment.systemPackages = [
+      packages.store
+      packages.tt-fsck
+      (pkgs.writeShellApplication {
+        name = "rehearse-cas-migration";
+        runtimeInputs = [
+          packages.store
+          packages.tt-fsck
+          pkgs.jq
+          pkgs.curl
+          pkgs.coreutils
+          pkgs.findutils
+          pkgs.gawk
+        ];
+        text = builtins.readFile "${tinytrader}/scripts/rehearse-cas-migration";
+      })
+    ];
     assertions = [
       {
         assertion = !config.tinytrader.services.store.enable || cfg.volumes != { };
