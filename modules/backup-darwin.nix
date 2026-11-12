@@ -49,7 +49,10 @@ in
 {
   # The repositories it copies are the deploy checkouts, where there are
   # some (scripts/backup-state; docs/decisions/0012).
-  imports = [ ./deploy-root-darwin.nix ];
+  imports = [
+    ./deploy-root-darwin.nix
+    ./watch-fresh.nix
+  ];
 
   options.tinytrader-deploy.backup = {
     enable = mkOption {
@@ -101,7 +104,7 @@ in
         StandardErrorPath = "${logs}/backup.log";
       };
       # The monitor checks the stamps the nightly run leaves.
-      tinytrader.services.watch.environment.WATCH_FRESH = here.fresh stateDir;
+      tinytrader-deploy.watchFresh = lib.splitString " " (here.fresh stateDir);
       environment.systemPackages = [
         b.package
         b.restore

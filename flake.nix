@@ -69,6 +69,22 @@
         // {
           # Nothing deployment-specific in this repository (checks/generic.nix).
           generic = import ./checks/generic.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+          # The switch guard's script on made-up systems (checks/switch-guard-test.sh).
+          switch-guard =
+            let
+              pkgs = nixpkgs.legacyPackages.${system};
+            in
+            pkgs.runCommand "switch-guard"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.diffutils
+                  pkgs.findutils
+                ];
+              }
+              ''
+                bash ${./checks/switch-guard-test.sh} ${./scripts/switch-guard} && touch $out
+              '';
           # The disk-hygiene job's script and the cargo shim on disposable folders (checks/disk-hygiene-test.sh).
           disk-hygiene =
             let

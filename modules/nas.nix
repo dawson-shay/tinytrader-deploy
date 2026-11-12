@@ -46,6 +46,7 @@
 }:
 {
   config,
+  options,
   lib,
   pkgs,
   ...
@@ -72,6 +73,10 @@ let
   here = name: planned || placedHere name;
   volumePaths = lib.mapAttrsToList (_: v: v.path) cfg.volumes;
   storeUser = "tinytrader-store";
+  # tinytrader's services module names a static user itself (`user`) from
+  # the revision that has it; with an older tinytrader the store's unit is
+  # given one below.
+  hasUserOption = (options.tinytrader.services.type.getSubOptions [ ]) ? user;
   # Before the store starts: each volume's path is a mount point and its id
   # file holds the id the machine's configuration expects (decision 0039).
   volumeCheck = pkgs.writeShellScript "tinytrader-store-volumes" ''
@@ -99,7 +104,14 @@ let
     }
     ${lib.concatStrings (
       lib.mapAttrsToList (
-        name: v: "check ${lib.escapeShellArgs [ name v.path v.id ]}
+        name: v:
+        "check ${
+          lib.escapeShellArgs [
+            name
+            v.path
+            v.id
+          ]
+        }
 "
       ) cfg.volumes
     )}
@@ -126,11 +138,13 @@ let
   # docs/decisions/0008): wherever inventory.nix places them.
   urlOf =
     to: port:
-    "http://${site.endpoints.address {
-      from = host;
-      runtime = "systemd";
-      inherit to port;
-    }}";
+    "http://${
+      site.endpoints.address {
+        from = host;
+        runtime = "systemd";
+        inherit to port;
+      }
+    }";
   url = to: urlOf to null;
   # Background work yields to live capture (tinytrader decisions 0011,
   # 0033): the relays a service `uses` by their observe port, wherever they
@@ -142,7 +156,11 @@ let
       map (u: lib.head (lib.splitString ":" u)) ((inventory.services.${name} or { }).uses or [ ])
     );
   yieldTo = relays: lib.concatMapStringsSep ";" (r: "${r}=${urlOf r "observe"}") relays;
-  uses = name: other: lib.any (u: lib.head (lib.splitString ":" u) == other) ((inventory.services.${name} or { }).uses or [ ]);
+  uses =
+    name: other:
+    lib.any (u: lib.head (lib.splitString ":" u) == other) (
+      (inventory.services.${name} or { }).uses or [ ]
+    );
   # The store's write token, once secrets/store.env exists (decision 0008):
   # the store requires it, and its writers send it.
   # The nightly backup (modules/backup.nix): its package and settings.
@@ -165,6 +183,8 @@ in
     ./nas-maintenance.nix
     # Deploying what merges to main (docs/decisions/0011), off unless asked.
     ./auto-deploy-nixos.nix
+    # No switch during market hours that changes a live-path unit.
+    (import ./switch-guard-nixos.nix { inherit site; })
   ];
 
   options.tinytrader-deploy.nas = {
@@ -210,6 +230,26 @@ in
         hand when the volume is made.
       '';
     };
+    backupReceive = {
+      enable = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Keep other hosts' off-host backup copies here (the inventory's
+          backup.offHost naming this host): accept their backup keys
+          (backup.keys) for `user`, restricted to rrsync, write-only, into
+          `<user's home>/Backups/tinytrader-from-<host>` (mode 700), from the
+          tailnet only, as a receiving Mac does
+          (tinytrader-deploy.backup.receive).
+        '';
+      };
+      user = mkOption {
+        type = types.nullOr types.str;
+        default = (site.inventory.backup.accounts or { }).${host} or null;
+        defaultText = lib.literalMD "the inventory's `backup.accounts.<host>`";
+        description = "The account the senders log in as (backup.accounts.<host> in the inventory).";
+      };
+    };
     historyTopoff = mkOption {
       type = types.listOf types.str;
       # The site's (inventory.nix deployment.native.alpaca-history.topoff),
@@ -234,13 +274,22 @@ in
           lib.length ids == lib.length (lib.unique ids);
         message = "tinytrader-deploy.nas.volumes: two volumes have the same id";
       }
+      {
+        assertion =
+          !cfg.backupReceive.enable
+          || (cfg.backupReceive.user != null && config.users.users ? ${cfg.backupReceive.user});
+        message = "tinytrader-deploy.nas.backupReceive: its user (the inventory's backup.accounts.${host}) must be an account of this machine";
+      }
     ];
 
     # The deploy checkouts are named as on a Mac: <deployRoot>/<deployment>.
     tinytrader-deploy.checkouts.site = lib.mkDefault "${config.tinytrader-deploy.deployRoot}/${site.name}";
 
     # The store's own system user: it owns what it writes on the volumes,
-    # across restarts and rebuilds (a DynamicUser's uid may change).
+    # across restarts and rebuilds (a DynamicUser's uid may change). With a
+    # tinytrader that has `user`, it is tinytrader.services.store.user (set
+    # below) and tinytrader's module makes the unit's User=; these
+    # definitions agree with it. Either way the unit runs as storeUser.
     users.users.${storeUser} = mkIf config.tinytrader.services.store.enable {
       isSystemUser = true;
       group = storeUser;
@@ -252,6 +301,12 @@ in
       # Each volume mounted first; if one isn't (a pool not imported, a disk
       # gone), the store doesn't start.
       unitConfig.RequiresMountsFor = volumePaths;
+      # A switch never restarts it: the recorders and the jobs write
+      # through it, so a new store starts when the operator restarts it
+      # (systemctl restart tinytrader-store), outside market hours. The
+      # switch guard (modules/switch-guard.nix) refuses a switch that
+      # changes it during them.
+      restartIfChanged = false;
       serviceConfig = {
         DynamicUser = lib.mkForce false;
         User = storeUser;
@@ -267,7 +322,8 @@ in
       import ../deploy/nomad/node.nix {
         inherit site host;
         runtime = "systemd";
-        siteCheckout = ((inventory.deployment.hosts or { }).${host} or { }).siteCheckout or "/srv/${site.name}";
+        siteCheckout =
+          ((inventory.deployment.hosts or { }).${host} or { }).siteCheckout or "/srv/${site.name}";
       }
     );
 
@@ -310,13 +366,39 @@ in
     systemd.timers.tinytrader-backup = mkIf (here "backup") {
       wantedBy = [ "timers.target" ];
       timerConfig = {
-        OnCalendar = "*-*-* ${
-          lib.fixedWidthNumber 2 inventory.backup.at.hour
-        }:${lib.fixedWidthNumber 2 inventory.backup.at.minute}:00";
+        OnCalendar = "*-*-* ${lib.fixedWidthNumber 2 inventory.backup.at.hour}:${lib.fixedWidthNumber 2 inventory.backup.at.minute}:00";
         Persistent = true;
       };
     };
-    systemd.tmpfiles.rules = lib.optional (here "backup") "d /var/backup/tinytrader 0700 root root -";
+    # Recording live streams: never restarted by a switch, as the store.
+    systemd.services.tinytrader-recorders =
+      mkIf (config.tinytrader.services.recorders.enable or false)
+        {
+          restartIfChanged = false;
+        };
+
+    systemd.tmpfiles.rules =
+      lib.optional (here "backup") "d /var/backup/tinytrader 0700 root root -"
+      ++ lib.optionals cfg.backupReceive.enable (
+        let
+          home = config.users.users.${cfg.backupReceive.user}.home;
+          u = cfg.backupReceive.user;
+          g = if config.users.users.${u}.group == "" then "users" else config.users.users.${u}.group;
+        in
+        [ "d ${home}/Backups 0700 ${u} ${g} -" ]
+        ++ map (from: "d ${backup.inbox home from} 0700 ${u} ${g} -") (backup.forHost host).senders
+      );
+
+    # Other hosts' off-host backup copies (the receiving side of
+    # inventory.nix backup.offHost; modules/backup.nix authorizedKeys).
+    # (Under mkIf: with the receiver off, its user may be unset.)
+    users.users.${if cfg.backupReceive.user == null then "root" else cfg.backupReceive.user} =
+      mkIf cfg.backupReceive.enable
+        {
+          openssh.authorizedKeys.keys =
+            (backup.forHost host).authorizedKeys
+              config.users.users.${cfg.backupReceive.user}.home;
+        };
 
     # Decrypted with the NAS's own SSH host key; nothing to copy onto it.
     sops.age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
@@ -378,7 +460,8 @@ in
         };
         writablePaths = volumePaths;
         secrets = withStoreToken "STORE_WRITE_TOKEN";
-      };
+      }
+      // lib.optionalAttrs hasUserOption { user = storeUser; };
 
       # The console, reading the services this host declares.
       console = {

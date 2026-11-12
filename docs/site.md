@@ -87,15 +87,31 @@ runner where `runner` runs, the backup where `backup` runs, the store and
 the Databento key's holders where they are placed natively
 ([roles/darwin.nix](../roles/darwin.nix)). Options: `tinytrader-deploy.deployRoot`,
 `.checkouts.{site,stack,tinytrader}`, `.autoDeploy.{enable,interval}`,
-`.backup.{enable,receive}`, and on NixOS `.autoDeploy.user` and
-`.nas.{enable,volumes,idFile,historyTopoff,maintenance}`
+`.backup.{enable,receive}`, `.switchGuard.{enable,services,hours}`, on a Mac
+`.networkWatch.{enable,interface,every,steadySeconds,maxAge}`
+([modules/network-watch-darwin.nix](../modules/network-watch-darwin.nix)), and on
+NixOS `.autoDeploy.user` and
+`.nas.{enable,volumes,idFile,historyTopoff,backupReceive,maintenance}`
 ([modules/nas.nix](../modules/nas.nix),
 [modules/nas-maintenance.nix](../modules/nas-maintenance.nix)). A NixOS
 role runs what the placement map puts on its host; while the host's `status`
 is `planned`, it runs everything it declares, so it is evaluated ahead of
 the hardware. Each NAS volume is `{ path; id; }`: the store starts only when
 every volume is mounted and its id file (`.tinytrader-volume-id` at its
-root) holds that id.
+root) holds that id. A switch never restarts the NAS's store or recorders
+(`restartIfChanged = false`): restart them by hand, outside market hours.
+
+**The switch guard** ([modules/switch-guard.nix](../modules/switch-guard.nix),
+[scripts/switch-guard](../scripts/switch-guard)), on every Mac and NixOS
+role unless `switchGuard.enable = false`: a `darwin-rebuild switch` or
+`nixos-rebuild switch` on a weekday inside `switchGuard.hours` (the site's
+`deployment.captureHours`, New York time) is refused when it adds, removes
+or changes the unit of a live-path service, one matching
+`switchGuard.services` (default: the site's
+`deployment.switchGuard.services`, else `deployment.autoDeploy.never` plus
+`store` and `recorders`). It knows no holidays: they count as trading days.
+To switch anyway: `sudo touch /var/run/tinytrader-switch-ok` (honoured for
+an hour). `scripts/deploy` and auto-deploy keep their own hours.
 
 ## Checkouts
 

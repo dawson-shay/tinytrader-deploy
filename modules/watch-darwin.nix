@@ -73,18 +73,26 @@ let
   };
 in
 {
+  # The stamps other modules leave for it (the backup's, the network check's).
+  imports = [ ./watch-fresh.nix ];
+
   tinytrader.services.watch = {
     enable = true;
     launchd = "daemon";
     package = start;
-    environment = w.environment // {
-      HOME = home;
-      XDG_STATE_HOME = "${home}/.local/state";
-      # launchd's PATH is minimal; launchctl is in /bin. (The daemon gets
-      # HOME and USER from tinytrader's module too; sops finds the operator
-      # key under HOME.)
-      PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
-    };
+    environment =
+      w.environment
+      // {
+        HOME = home;
+        XDG_STATE_HOME = "${home}/.local/state";
+        # launchd's PATH is minimal; launchctl is in /bin. (The daemon gets
+        # HOME and USER from tinytrader's module too; sops finds the operator
+        # key under HOME.)
+        PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+      }
+      // lib.optionalAttrs (config.tinytrader-deploy.watchFresh != [ ]) {
+        WATCH_FRESH = lib.concatStringsSep " " config.tinytrader-deploy.watchFresh;
+      };
   };
 
   # The machine's CPU, memory, swap and disks for the console's Hosts views
