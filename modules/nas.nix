@@ -280,6 +280,16 @@ in
         ];
         text = builtins.readFile "${tinytrader}/scripts/rehearse-cas-migration";
       })
+      # Plan B (a plain copy of each source drive): every file checked,
+      # byte for byte, before a source is reused.
+      (pkgs.writeShellApplication {
+        name = "verify-tree-copy";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.findutils
+        ];
+        text = builtins.readFile ../scripts/verify-tree-copy;
+      })
     ];
     assertions = [
       {

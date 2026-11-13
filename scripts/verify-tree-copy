@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Check that a copy of a folder tree holds every file of the source, byte for
+# byte: each regular file's path, size and SHA-256 in SOURCE must be the same
+# in COPY. Both are only read.
+#
+#   verify-tree-copy SOURCE COPY [REPORT]
+#
+# - Every source file missing from the copy, or different there, is listed.
+#   So is anything in the source that isn't a regular file or a folder
+#   (links, devices): it wasn't checked.
+# - Files only in the copy are listed too, for information.
+# - The OS's own folders at the source's root (.Spotlight-V100, .fseventsd,
+#   .Trashes, .TemporaryItems, .DocumentRevisions-V100) are skipped, and
+#   listed as skipped.
+# - A source with no files is refused: an unmounted drive is an empty folder.
+#
+# The report (TSV: status, path, source sha256, copy sha256) goes to REPORT
+# (default: ./verify-<source folder name>.tsv), and a summary to stdout.
+#
+# Exit status:
+#   0  every source file is in the copy, identical, and nothing was unchecked;
+#   1  anything missing, different, or unchecked;
+#   2  bad arguments, or a source or copy that can't be read or is empty.
+set -euo pipefail
+
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+  echo "usage: verify-tree-copy SOURCE COPY [REPORT]" >&2
+  exit 2
+fi
+SRC=$1
+DST=$2
+REPORT=${3:-./verify-$(basename "$SRC").tsv}
+for d in "$SRC" "$DST"; do
+  [ -d "$d" ] || { echo "verify-tree-copy: $d isn't a folder" >&2; exit 2; }
+done
+SRC=$(cd "$SRC" && pwd -P)
+DST=$(cd "$DST" && pwd -P)
+if command -v sha256sum >/dev/null; then sha() { sha256sum -- "$1" | cut -d' ' -f1; }
+else sha() { shasum -a 256 -- "$1" | cut -d' ' -f1; }; fi
+
+prune=(-path "$SRC/.Spotlight-V100" -o -path "$SRC/.fseventsd" -o -path "$SRC/.Trashes"
+  -o -path "$SRC/.TemporaryItems" -o -path "$SRC/.DocumentRevisions-V100")
+
+if [ -z "$(find "$SRC" \( "${prune[@]}" \) -prune -o -type f -print -quit)" ]; then
+  echo "verify-tree-copy: $SRC holds no files; is the drive mounted? Nothing verified." >&2
+  exit 2
+fi
+
+: >"$REPORT"
+n=0 same=0 missing=0 different=0 unchecked=0 unreadable=0 skipped=0 extra=0
+# The OS's own folders at the root: skipped, listed.
+while IFS= read -r -d '' p; do
+  printf 'skipped\t%s\t\t\n' "${p#"$SRC"/}" >>"$REPORT"
+  skipped=$((skipped + 1))
+done < <(find "$SRC" -mindepth 1 -maxdepth 1 \( "${prune[@]}" \) -print0)
+# Anything not a file or a folder: unchecked, a failure.
+while IFS= read -r -d '' p; do
+  printf 'unchecked\t%s\t\t\n' "${p#"$SRC"/}" >>"$REPORT"
+  unchecked=$((unchecked + 1))
+done < <(find "$SRC" \( "${prune[@]}" \) -prune -o ! -type f ! -type d -print0)
+# Every regular file, compared.
+while IFS= read -r -d '' p; do
+  rel=${p#"$SRC"/}
+  n=$((n + 1))
+  if ! s=$(sha "$p" 2>/dev/null); then
+    printf 'unreadable-source\t%s\t\t\n' "$rel" >>"$REPORT"
+    unreadable=$((unreadable + 1))
+    continue
+  fi
+  if [ ! -f "$DST/$rel" ]; then
+    printf 'missing\t%s\t%s\t\n' "$rel" "$s" >>"$REPORT"
+    missing=$((missing + 1))
+    continue
+  fi
+  if ! c=$(sha "$DST/$rel" 2>/dev/null); then
+    printf 'unreadable-copy\t%s\t%s\t\n' "$rel" "$s" >>"$REPORT"
+    unreadable=$((unreadable + 1))
+    continue
+  fi
+  if [ "$s" = "$c" ]; then
+    same=$((same + 1))
+  else
+    printf 'different\t%s\t%s\t%s\n' "$rel" "$s" "$c" >>"$REPORT"
+    different=$((different + 1))
+  fi
+  if [ $((n % 1000)) = 0 ]; then
+    echo "verify-tree-copy: $n files checked" >&2
+  fi
+done < <(find "$SRC" \( "${prune[@]}" \) -prune -o -type f -print0)
+# Files only in the copy: for information.
+while IFS= read -r -d '' p; do
+  rel=${p#"$DST"/}
+  if [ ! -e "$SRC/$rel" ]; then
+    printf 'only-in-copy\t%s\t\t\n' "$rel" >>"$REPORT"
+    extra=$((extra + 1))
+  fi
+done < <(find "$DST" -type f -print0)
+
+echo "source $SRC -> copy $DST: $n files; $same identical, $missing missing, $different different, $unreadable unreadable, $unchecked unchecked (links, devices); $skipped OS folders skipped; $extra only in the copy. Report: $REPORT"
+if [ $((missing + different + unreadable + unchecked)) -gt 0 ]; then
+  echo "NOT VERIFIED: keep the source drive as it is." >&2
+  exit 1
+fi
+echo "VERIFIED: every source file is in the copy, identical."
