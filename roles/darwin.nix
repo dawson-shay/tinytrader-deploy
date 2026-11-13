@@ -16,6 +16,11 @@
 #                          runs, receiving when the machine sets tinytrader-deploy.backup.receive
 #   auto-deploy            off until the machine sets tinytrader-deploy.autoDeploy.enable
 #                          (modules/auto-deploy-darwin.nix)
+#   switch guard           a switch during market hours that changes a live-path job is
+#                          refused (modules/switch-guard-darwin.nix)
+#   network-watch          off until the machine sets tinytrader-deploy.networkWatch.enable:
+#                          the monitor warns when the default route isn't wired or the
+#                          link flaps (modules/network-watch-darwin.nix)
 #   databento-jobs, relay-*  the Databento key's holders, where placed with runtime launchd
 #                          (modules/databento-darwin.nix; needs sops-nix's darwin module)
 #   store, alpaca-history  where placed with runtime launchd (modules/store-darwin.nix)
@@ -97,6 +102,12 @@ in
     # Deploying what is merged to main, every 5 minutes, once the machine's
     # config sets tinytrader-deploy.autoDeploy.enable (docs/decisions/0011).
     (import ../modules/auto-deploy-darwin.nix { dockerSocket = socket; })
+    # No switch during market hours that changes a live-path launchd job
+    # (tinytrader-deploy.switchGuard; on unless the machine turns it off).
+    (import ../modules/switch-guard-darwin.nix { inherit site; })
+    # Warnings when the default route leaves the wired interface or its link
+    # flaps, once the machine sets tinytrader-deploy.networkWatch.enable.
+    ../modules/network-watch-darwin.nix
   ]
   # databento-jobs and the OPRA relays, the only readers of the Databento
   # key (docs/decisions/0013).

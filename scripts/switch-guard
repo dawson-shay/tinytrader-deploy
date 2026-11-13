@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Refuse to switch a machine to a new configuration during market hours when
+# a live-path service's unit changes (modules/switch-guard-nixos.nix runs it
+# as a NixOS pre-switch check, modules/switch-guard-darwin.nix at the start
+# of nix-darwin's activation). A switch restarts what it changes, and a
+# relay, an order gateway, a strategy, the store or a recorder restarted
+# mid-session drops its clients or its capture.
+#   switch-guard NEW-SYSTEM [ACTION]
+# NEW-SYSTEM is the configuration being switched to; ACTION is
+# switch-to-configuration's (boot and dry-activate are never refused: they
+# restart nothing now).
+#
+# Refused only when all hold:
+#   - it's Monday to Friday, inside SWITCH_GUARD_HOURS New York time
+#     (HH:MM-HH:MM, default 09:25-16:20). Holidays aren't known here, so a
+#     holiday is treated as a trading day;
+#   - a unit of a service matching SWITCH_GUARD_SERVICES (shell patterns,
+#     space-separated: "relay-* order-gateway-* store") is added, removed or
+#     changed between the current system and NEW-SYSTEM;
+#   - there is no override: SWITCH_GUARD_OVERRIDE (default
+#     /var/run/tinytrader-switch-ok) modified in the last hour. To switch
+#     anyway: sudo touch /var/run/tinytrader-switch-ok
+# SWITCH_GUARD_KIND says where the units are: "systemd"
+# (etc/systemd/system/tinytrader-NAME.service) or "launchd"
+# (Library/LaunchDaemons and user/Library/LaunchAgents, com.tinytrader.NAME.plist).
+# For tests: SWITCH_GUARD_CURRENT (default /run/current-system) and
+# SWITCH_GUARD_NOW ("DOW HHMM", DOW 1-7 from Monday).
+set -euo pipefail
+
+new="${1:?usage: switch-guard NEW-SYSTEM [ACTION]}"
+action="${2:-switch}"
+kind="${SWITCH_GUARD_KIND:?SWITCH_GUARD_KIND is systemd or launchd}"
+patterns="${SWITCH_GUARD_SERVICES:-}"
+hours="${SWITCH_GUARD_HOURS:-09:25-16:20}"
+current="${SWITCH_GUARD_CURRENT:-/run/current-system}"
+override="${SWITCH_GUARD_OVERRIDE:-/var/run/tinytrader-switch-ok}"
+
+case "$action" in
+  boot | dry-activate) exit 0 ;;
+esac
+[ -n "$patterns" ] || exit 0
+
+if [ -n "${SWITCH_GUARD_NOW:-}" ]; then
+  read -r dow hm <<<"$SWITCH_GUARD_NOW"
+else
+  dow="$(TZ=America/New_York date +%u)"
+  hm="$(TZ=America/New_York date +%H%M)"
+fi
+open="${hours%-*}" close="${hours#*-}"
+open="${open/:/}" close="${close/:/}"
+# Leading zeros: 0925 is 925, not octal.
+if [ "$dow" -gt 5 ] || [ "$((10#$hm))" -lt "$((10#$open))" ] || [ "$((10#$hm))" -ge "$((10#$close))" ]; then
+  exit 0
+fi
+
+if [ -e "$override" ] && [ -n "$(find "$override" -mmin -60 2>/dev/null)" ]; then
+  echo "switch-guard: $override is under an hour old: switching during market hours anyway" >&2
+  exit 0
+fi
+
+# The live-path services' unit files in a system: NAME<TAB>PATH lines.
+units() {
+  local sys="$1" f base name
+  case "$kind" in
+    systemd) set -- "$sys"/etc/systemd/system/tinytrader-*.service ;;
+    launchd) set -- "$sys"/Library/LaunchDaemons/com.tinytrader.*.plist "$sys"/user/Library/LaunchAgents/com.tinytrader.*.plist ;;
+    *) echo "switch-guard: SWITCH_GUARD_KIND must be systemd or launchd, not $kind" >&2; exit 2 ;;
+  esac
+  for f in "$@"; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"
+    case "$kind" in
+      systemd) name="${base#tinytrader-}"; name="${name%.service}" ;;
+      launchd) name="${base#com.tinytrader.}"; name="${name%.plist}" ;;
+    esac
+    for p in $patterns; do
+      # shellcheck disable=SC2254 # $p is a pattern on purpose
+      case "$name" in
+        $p) printf '%s\t%s\n' "$name" "$f"; break ;;
+      esac
+    done
+  done
+}
+
+changed=()
+declare -A old_unit=() new_unit=()
+while IFS=$'\t' read -r n f; do old_unit[$n]="$f"; done < <(units "$current")
+while IFS=$'\t' read -r n f; do new_unit[$n]="$f"; done < <(units "$new")
+for n in "${!old_unit[@]}"; do
+  if [ -z "${new_unit[$n]:-}" ]; then changed+=("$n (removed)"); fi
+done
+for n in "${!new_unit[@]}"; do
+  if [ -z "${old_unit[$n]:-}" ]; then
+    changed+=("$n (added)")
+  elif ! cmp -s "${old_unit[$n]}" "${new_unit[$n]}"; then
+    changed+=("$n")
+  fi
+done
+
+if [ "${#changed[@]}" -gt 0 ]; then
+  {
+    echo "switch-guard: refusing to switch: it's $(TZ=America/New_York date +%H:%M) ET on a weekday, inside $hours,"
+    echo "  and this changes live-path services, which the switch would restart:"
+    printf '    %s\n' "${changed[@]}"
+    echo "  Switch after the close, or, to switch now anyway: sudo touch $override (good for an hour)."
+  } >&2
+  exit 1
+fi
