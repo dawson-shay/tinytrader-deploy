@@ -95,20 +95,23 @@ logged "docker: auto-deploy is running"
 echo "== bad settings stop it"
 if DISK_HYGIENE_DRY_RUN=yes sh "$script" >/dev/null 2>&1; then fail "DRY_RUN=yes accepted"; fi
 if DISK_HYGIENE_TARGET_DAYS=x sh "$script" >/dev/null 2>&1; then fail "TARGET_DAYS=x accepted"; fi
-echo "== the cargo shim: one target per repository, worktrees included"
+echo "== the cargo shim: one build folder per repository, worktrees included; binaries per checkout"
 shim="$(cd "$(dirname "$2")" && pwd -P)/$(basename "$2")"
 mkdir -p "$work/real" "$work/shim" && cp "$shim" "$work/shim/cargo"
-printf '#!/bin/sh\necho "${CARGO_TARGET_DIR:-unset}"\n' >"$work/real/cargo" && chmod +x "$work/real/cargo"
+printf '#!/bin/sh\necho "${CARGO_TARGET_DIR:-unset} ${CARGO_BUILD_BUILD_DIR:-unset}"\n' >"$work/real/cargo" && chmod +x "$work/real/cargo"
 g() { git -c user.name=t -c user.email=t@example.invalid "$@" >/dev/null 2>&1; }
 g init -q "$work/src/myrepo" && g -C "$work/src/myrepo" commit -q --allow-empty -m x
 g -C "$work/src/myrepo" worktree add -q "$work/wt/feature"
-want="$HOME/.cache/cargo-target/myrepo/target"
+# CARGO_TARGET_DIR stays unset (each checkout's own ./target); the build folder is shared.
+want="unset $HOME/.cache/cargo-target/myrepo/target"
 for d in "$work/src/myrepo" "$work/wt/feature"; do
   got="$(cd "$d" && PATH="$work/shim:$work/real:$PATH" cargo)"
   [ "$got" = "$want" ] || fail "shim in $d: $got"
 done
 got="$(cd "$work/wt/feature" && CARGO_TARGET_DIR=/kept PATH="$work/shim:$work/real:$PATH" cargo)"
-[ "$got" = /kept ] || fail "shim overrode CARGO_TARGET_DIR: $got"
+[ "$got" = "/kept unset" ] || fail "shim overrode CARGO_TARGET_DIR: $got"
+got="$(cd "$work/wt/feature" && CARGO_BUILD_BUILD_DIR=/kept PATH="$work/shim:$work/real:$PATH" cargo)"
+[ "$got" = "unset /kept" ] || fail "shim overrode CARGO_BUILD_BUILD_DIR: $got"
 got="$(cd "$work" && PATH="$work/shim:$work/real:$PATH" cargo)"
-[ "$got" = unset ] || fail "shim outside a repository: $got"
+[ "$got" = "unset unset" ] || fail "shim outside a repository: $got"
 echo "disk-hygiene: ok"

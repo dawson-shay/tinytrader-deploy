@@ -973,21 +973,25 @@ make a new operator key, put its public half in the inventory
   Merging is the operator's call.
 - **Remove your worktree when done:** `git -C ~/repos/<repo> worktree remove
   ~/repos/wt/<name>`, and delete scratch files.
-- **One cargo target per repository, per machine** (decision
+- **One cargo build folder per repository, per machine** (decision
   [0016](decisions/0016-disk-hygiene.md)): every checkout of a repository,
-  its worktrees included, builds into
-  `~/.cache/cargo-target/<repo>/target`, never a `target/` of its own.
-  This stack's `scripts/cargo-shim` sets `CARGO_TARGET_DIR` so, from the
-  repository's common Git folder (a worktree gets its main checkout's).
-  Your machines repository installs it as `cargo` on PATH ahead of the real
-  one, for example in a directory first on PATH in `~/.zshenv`, so it
-  covers interactive shells, `zsh -c` and agents' shells alike. A
-  `CARGO_TARGET_DIR` already set wins: the Nomad build and test jobs set
-  the deploy checkout's own (`<checkout>/target`), so a working copy's
-  build never overwrites the binaries a deploy built. Concurrent builds of
-  one repository wait for cargo's lock; that is expected. The
-  `disk-hygiene` job deletes a target idle for 7 days (with
-  `.cache/cargo-target` among the node's `cleanRoots`).
+  its worktrees included, keeps cargo's intermediate files (dependencies,
+  incremental state, build scripts) in one shared build folder,
+  `~/.cache/cargo-target/<repo>/target`. The finished binaries stay in the
+  checkout's own `./target`, one set per checkout, so a binary at
+  `target/release/<bin>` is always that checkout's build. This stack's
+  `scripts/cargo-shim` sets `CARGO_BUILD_BUILD_DIR` so (cargo 1.91 and
+  later), from the repository's common Git folder (a worktree gets its main
+  checkout's). Your machines repository installs it as `cargo` on PATH
+  ahead of the real one, for example in a directory first on PATH in
+  `~/.zshenv`, so it covers interactive shells, `zsh -c` and agents' shells
+  alike. A `CARGO_TARGET_DIR` or `CARGO_BUILD_BUILD_DIR` already set wins:
+  the Nomad build and test jobs set the deploy checkout's own
+  (`<checkout>/target`). Concurrent builds of one repository wait for
+  cargo's lock; that is expected. The `disk-hygiene` job deletes a build
+  folder or a checkout's `target/` idle for 7 days (with
+  `.cache/cargo-target` and the checkouts' roots among the node's
+  `cleanRoots`).
 
   Moving from one global target (`[build] target-dir` in
   `~/.cargo/config.toml`), once per machine:
