@@ -1,6 +1,7 @@
 # 0016: The Macs clean up after builds, and warn before the disk is full
 
-- **Status:** Accepted
+- **Status:** Accepted; the shared folder holds only cargo's intermediate
+  files since 2026-11-14 (below, "Binaries per checkout")
 - **Date:** 2026-10-26
 - **Amends:** [0006](0006-host-monitoring.md) (the disk thresholds),
   [0014](0014-nomad-batch-scheduler.md) (a periodic job on every Mac)
@@ -75,3 +76,17 @@ at 90% used, which on a small disk is already too late to clean up calmly.
   too, until `watch` takes thresholds per disk.
 - lsof is read once at the start: a build that starts during the run is
   seen only through the 7-day rule.
+
+## Binaries per checkout (2026-11-14)
+
+With one `CARGO_TARGET_DIR` per repository, every checkout's finished
+binaries went to one path, `target/release/<bin>`, so the last build to
+finish won: a binary run by its path could be another worktree's build. The
+shim now sets `CARGO_BUILD_BUILD_DIR` (cargo 1.91 and later) instead: the
+intermediate files (`deps/`, `incremental/`, build scripts), most of a
+target's size, stay in the shared `~/.cache/cargo-target/<repo>/target`,
+while the finished binaries go to the checkout's own `./target`, cargo's
+default. Each checkout holds a copy of its own binaries, a few hundred MB
+for a debug build of this stack; `disk-hygiene` deletes an idle one like
+any other target (it sits beside a `Cargo.toml`), and the shared folder
+keeps its name, so the job finds it as before.

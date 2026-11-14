@@ -1,18 +1,21 @@
 #!/bin/sh
-# cargo, building into one target per repository on this machine
-# (docs/decisions/0016): CARGO_TARGET_DIR is
+# cargo, sharing one build folder per repository on this machine
+# (docs/decisions/0016): CARGO_BUILD_BUILD_DIR, where cargo keeps its
+# intermediate files (deps/, incremental/, build scripts), is
 # ~/.cache/cargo-target/<repo>/target, <repo> named by the repository's
-# common Git folder, so every worktree of it shares its main checkout's.
-# Your machines repository installs it as `cargo` on PATH ahead of the
-# real one (docs/operations.md, Agent hygiene); it then covers every
-# shell, interactive or not, agents' too. A CARGO_TARGET_DIR already set
-# is kept (the Nomad build jobs set their own); outside a repository it
-# changes nothing.
+# common Git folder, so every worktree of it shares its main checkout's
+# compiled dependencies. The finished binaries stay in the checkout's own
+# ./target (cargo's default), one set per checkout, so two checkouts never
+# overwrite each other's target/release/<bin>. Your machines repository
+# installs it as `cargo` on PATH ahead of the real one (docs/operations.md,
+# Agent hygiene); it then covers every shell, interactive or not, agents'
+# too. A CARGO_TARGET_DIR or CARGO_BUILD_BUILD_DIR already set is kept (the
+# Nomad build jobs set their own); outside a repository it changes nothing.
 set -eu
-if [ -z "${CARGO_TARGET_DIR:-}" ] && common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+if [ -z "${CARGO_TARGET_DIR:-}" ] && [ -z "${CARGO_BUILD_BUILD_DIR:-}" ] && common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
   repo="$(basename "${common%/.git}")"
-  CARGO_TARGET_DIR="$HOME/.cache/cargo-target/${repo%.git}/target"
-  export CARGO_TARGET_DIR
+  CARGO_BUILD_BUILD_DIR="$HOME/.cache/cargo-target/${repo%.git}/target"
+  export CARGO_BUILD_BUILD_DIR
 fi
 # The next cargo on PATH that isn't this one.
 IFS=:
